@@ -23,8 +23,10 @@ client = OpenAI(
     base_url="https://api.groq.com/openai/v1",
 )
 
-# Vision model (multimodal)
+# Vision model (multimodal, good for production)
 GROQ_VISION_MODEL_ID = "meta-llama/llama-4-maverick-17b-128e-instruct"
+# If you want to test Scout instead, change to:
+# GROQ_VISION_MODEL_ID = "meta-llama/llama-4-scout-17b-16e-instruct"
 
 
 # ============================================================
@@ -72,11 +74,11 @@ class ExtractBillDataResponse(BaseModel):
 
 app = FastAPI(
     title="Bajaj Datathon Bill Extraction API",
-    version="2.0.0",
+    version="2.1.0",
     description=(
         "Extracts line items from bill / invoice documents using Groq vision models "
-        "plus OCR assistance. Implements the exact response schema required by "
-        "HackRx Datathon."
+        "with optional OCR assistance. Implements the exact response schema "
+        "required by HackRx Datathon."
     ),
 )
 
@@ -88,9 +90,10 @@ app = FastAPI(
 def download_document(url: str) -> bytes:
     """
     Download the document from the given URL.
-    Works with:
+    Supports:
     - Direct image URLs (png, jpg, jpeg, webp, etc.)
     - Direct PDF URLs
+    - Public file links that resolve to the above
     """
     try:
         resp = requests.get(url, timeout=40)
@@ -121,13 +124,13 @@ def image_to_data_url(img: Image.Image, quality: int = 85) -> str:
     """
     Convert a PIL Image into a base64 JPEG data URL.
 
-    Groq limits base64 images to ~4MB – we adaptively reduce JPEG quality.
+    Groq limits base64 images to ~4MB – adaptively reduce JPEG quality.
     """
     buf = io.BytesIO()
     img.save(buf, format="JPEG", quality=quality)
     b = buf.getvalue()
 
-    # Adaptive compression
+    # Adaptive compression loop
     while len(b) > 4 * 1024 * 1024 and quality > 30:
         quality -= 10
         buf = io.BytesIO()
@@ -144,17 +147,14 @@ def extract_ocr_text(img: Image.Image) -> str:
     """
     Run Tesseract OCR on the given image.
 
-    If pytesseract is not installed or Tesseract is missing,
-    we fail silently and return an empty string (vision model still works).
+    If pytesseract or Tesseract is not available, returns "" silently.
     """
     try:
         import pytesseract
     except Exception:
-        # Optional dependency – no hard failure
         return ""
 
     try:
-        # You can tweak config if needed
         text = pytesseract.image_to_string(img)
         return text or ""
     except Exception:
@@ -163,8 +163,7 @@ def extract_ocr_text(img: Image.Image) -> str:
 
 def is_mostly_blank(img: Image.Image, ocr_text: str) -> bool:
     """
-    Heuristic: detect near-blank pages so we don't send
-    blank scans / separators to the LLM.
+    Heuristic: detect near-blank pages so we don't send separators/blank scans.
 
     Criteria:
     - Very bright (mean grayscale > 245)
@@ -173,10 +172,7 @@ def is_mostly_blank(img: Image.Image, ocr_text: str) -> bool:
     gray = img.convert("L")
     stat = ImageStat.Stat(gray)
     mean = stat.mean[0] if stat.mean else 255.0
-
-    if mean > 245 and len(ocr_text.strip()) < 30:
-        return True
-    return False
+    return bool(mean > 245 and len(ocr_text.strip()) < 30)
 
 
 def document_to_page_infos(url: str, content: bytes) -> List[Dict[str, Any]]:
@@ -194,7 +190,6 @@ def document_to_page_infos(url: str, content: bytes) -> List[Dict[str, Any]]:
     - If PDF: one image per page.
     """
     mime = guess_mime_type(url, content)
-
     page_infos: List[Dict[str, Any]] = []
 
     # Single images
@@ -208,13 +203,14 @@ def document_to_page_infos(url: str, content: bytes) -> List[Dict[str, Any]]:
             )
 
         ocr_text = extract_ocr_text(img)
-        info = {
-            "pil_image": img,
-            "data_url": image_to_data_url(img),
-            "ocr_text": ocr_text,
-            "is_blank": is_mostly_blank(img, ocr_text),
-        }
-        page_infos.append(info)
+        page_infos.append(
+            {
+                "pil_image": img,
+                "data_url": image_to_data_url(img),
+                "ocr_text": ocr_text,
+                "is_blank": is_mostly_blank(img, ocr_text),
+            }
+        )
         return page_infos
 
     # PDFs
@@ -234,16 +230,17 @@ def document_to_page_infos(url: str, content: bytes) -> List[Dict[str, Any]]:
         for p in pages:
             img = p.convert("RGB")
             ocr_text = extract_ocr_text(img)
-            info = {
-                "pil_image": img,
-                "data_url": image_to_data_url(img),
-                "ocr_text": ocr_text,
-                "is_blank": is_mostly_blank(img, ocr_text),
-            }
-            page_infos.append(info)
+            page_infos.append(
+                {
+                    "pil_image": img,
+                    "data_url": image_to_data_url(img),
+                    "ocr_text": ocr_text,
+                    "is_blank": is_mostly_blank(img, ocr_text),
+                }
+            )
         return page_infos
 
-    # Fallback: try as image
+    # Fallback: try as image anyway
     try:
         img = Image.open(io.BytesIO(content)).convert("RGB")
     except Exception:
@@ -253,13 +250,14 @@ def document_to_page_infos(url: str, content: bytes) -> List[Dict[str, Any]]:
         )
 
     ocr_text = extract_ocr_text(img)
-    info = {
-        "pil_image": img,
-        "data_url": image_to_data_url(img),
-        "ocr_text": ocr_text,
-        "is_blank": is_mostly_blank(img, ocr_text),
-    }
-    page_infos.append(info)
+    page_infos.append(
+        {
+            "pil_image": img,
+            "data_url": image_to_data_url(img),
+            "ocr_text": ocr_text,
+            "is_blank": is_mostly_blank(img, ocr_text),
+        }
+    )
     return page_infos
 
 
@@ -354,7 +352,7 @@ def call_groq_for_page(
     """
     Call Groq Vision model for a single page image, with OCR text as hint.
     """
-    # Truncate OCR text to keep prompt reasonable
+    # Truncate OCR text to keep prompt size reasonable
     ocr_text_snippet = (ocr_text or "").strip()
     if len(ocr_text_snippet) > 2000:
         ocr_text_snippet = ocr_text_snippet[:2000]
@@ -479,11 +477,11 @@ def _coerce_number(x: Any) -> float:
 
 def clean_page_dict(page_dict: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Pre-clean the raw JSON dict from the model so that Pydantic parsing will not fail
-    when numeric fields are null/empty/etc.
+    Pre-clean the raw JSON dict from the model so that Pydantic parsing will not
+    fail when numeric fields are null/empty/etc.
     """
     bill_items = page_dict.get("bill_items", []) or []
-    cleaned_items = []
+    cleaned_items: List[Dict[str, Any]] = []
 
     for item in bill_items:
         if not isinstance(item, dict):
@@ -528,6 +526,7 @@ def reconcile_page_items(page_dict: Dict[str, Any]) -> PageItems:
         if rate and qty:
             computed = rate * qty
             if math.isfinite(computed) and abs(computed - amount) > EPS:
+                # Trust arithmetic over noisy OCR when there is a big mismatch
                 item.item_amount = round(computed, 2)
         elif amount and qty and qty != 0:
             computed_rate = amount / qty
@@ -546,9 +545,6 @@ def dedupe_all_pages(pages: List[PageItems]) -> List[PageItems]:
     We treat items with the same:
         (page_type, normalized_name, rate, qty, amount)
     as duplicates and keep only the first occurrence.
-
-    This is mainly to avoid hallucinated repeated segments
-    (e.g., same pharmacy list repeated on multiple pages).
     """
     seen: set = set()
     deduped_pages: List[PageItems] = []
@@ -564,7 +560,7 @@ def dedupe_all_pages(pages: List[PageItems]) -> List[PageItems]:
                 round(float(item.item_amount), 2),
             )
             if key in seen:
-                # duplicate – likely hallucinated repetition
+                # duplicate – likely repetition of the same list
                 continue
             seen.add(key)
             new_items.append(item)
@@ -637,7 +633,7 @@ def extract_bill_data(req: ExtractBillDataRequest):
     logical_page_no = 1
     for info in page_infos:
         if info.get("is_blank"):
-            # skip obviously blank pages
+            # Skip obviously blank pages
             continue
 
         data_url = info["data_url"]
