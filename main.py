@@ -42,7 +42,8 @@ MODEL_MAVERICK = "meta-llama/llama-4-maverick-17b-128e-instruct"
 MODEL_SCOUT = "meta-llama/llama-4-scout-17b-16e-instruct"
 
 # EasyOCR (Replacing PaddleOCR, keeping code identical otherwise)
-easy_ocr = Reader(['en'], gpu=False)
+easy_ocr = Reader(['en'], gpu=False, model_storage_directory='/app/models', download_enabled=True, detector='dbnet', recognizer='robustscanner', quantize=True)
+
 
 # ============================================================
 #  BASIC SCHEMAS (Datathon Spec)
