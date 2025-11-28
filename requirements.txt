@@ -16,4 +16,4 @@ pytesseract
 
 opencv-python
 numpy
-openai
+
