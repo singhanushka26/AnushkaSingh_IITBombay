@@ -277,12 +277,7 @@ app = FastAPI(
 # ============================================================
 
 def is_blank_page(img: Image.Image, ocr_text: str) -> bool:
-    gray = img.convert("L")
-    stat = ImageStat.Stat(gray)
-    mean = stat.mean[0] if stat.mean else 255.0
-    if mean > 245 and len(ocr_text.strip()) < 30:
-        return True
-    return False
+    continue
 
 
 # ============================================================
