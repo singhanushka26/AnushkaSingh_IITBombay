@@ -5,7 +5,7 @@ import json
 import math
 import mimetypes
 import os
-from typing import List, Optional
+from typing import List, Optional, Tuple, Any, Dict
 
 import requests
 from fastapi import FastAPI, HTTPException
@@ -23,10 +23,8 @@ client = OpenAI(
     base_url="https://api.groq.com/openai/v1",
 )
 
-# Vision model (multimodal)
-GROQ_VISION_MODEL_ID = "meta-llama/llama-4-maverick-17b-128e-instruct"
-# If you want a more stable one, uncomment this:
-# GROQ_VISION_MODEL_ID = "meta-llama/llama-3.2-90b-vision-instruct"
+# Vision model (multimodal) – as you requested
+GROQ_VISION_MODEL_ID = "meta-llama/llama-3.2-90b-vision-instruct"
 
 
 # ============================================================
@@ -74,7 +72,7 @@ class ExtractBillDataResponse(BaseModel):
 
 app = FastAPI(
     title="Bajaj Datathon Bill Extraction API",
-    version="1.1.0",
+    version="1.2.0",
     description=(
         "Extracts line items from bill / invoice documents using Groq vision models. "
         "Implements the exact response schema required by HackRx Datathon."
@@ -87,7 +85,14 @@ app = FastAPI(
 # ============================================================
 
 def download_document(url: str) -> bytes:
-    """Download the document from the given URL."""
+    """
+    Download the document from the given URL.
+
+    Works with:
+    - Direct image URLs (png, jpg, jpeg, webp, etc.)
+    - Direct PDF URLs
+    - Google Drive 'uc?export=download&id=...' style links
+    """
     try:
         resp = requests.get(url, timeout=40)
         resp.raise_for_status()
@@ -102,17 +107,20 @@ def download_document(url: str) -> bytes:
 def guess_mime_type(url: str, content: bytes) -> str:
     """
     Guess mime type based on URL extension or magic bytes.
-    We use URL extension primarily; fall back to simple PDF header check.
+
+    We:
+    - First try: mimetypes from the URL.
+    - Then: detect PDFs via '%PDF' header.
+    - Fallback: 'application/octet-stream'.
     """
     mime, _ = mimetypes.guess_type(url)
     if mime:
         return mime
 
-    # crude PDF check
+    # crude PDF header check
     if content[:4] == b"%PDF":
         return "application/pdf"
 
-    # last resort
     return "application/octet-stream"
 
 
@@ -164,8 +172,11 @@ def document_to_page_images(url: str, content: bytes) -> List[str]:
         except Exception as e:
             raise HTTPException(
                 status_code=400,
-                detail=f"Unable to convert PDF to images. "
-                       f"Is poppler installed? Error: {e}",
+                detail=(
+                    "Unable to convert PDF to images. "
+                    "Ensure poppler is installed and available in PATH. "
+                    f"Error: {e}"
+                ),
             )
         data_urls: List[str] = []
         for p in pages:
@@ -185,7 +196,7 @@ def document_to_page_images(url: str, content: bytes) -> List[str]:
 
 
 # ============================================================
-#  LLM Prompt
+#  LLM Prompt – LONG, STRICT VERSION
 # ============================================================
 
 SYSTEM_PROMPT = """
@@ -214,9 +225,10 @@ VERY IMPORTANT RULES:
 3. Use the numeric columns exactly:
    - item_quantity = the value under "Qty" or "Qty/Hrs" or equivalent.
    - item_rate     = the "Rate" column (per unit).
-   - item_amount   = the "Total", "Net Amt", or "Amt (Rs.)" column for that row.
+   - item_amount   = the "Gross Amount", "Net Amt", "Total", or "Amt (Rs.)" column for that row.
    - If quantity is clearly missing but there is a total, assume quantity = 1 and rate = total.
    - If rate is missing but quantity and amount are visible, set rate = amount / quantity.
+   - If a numeric value is BLANK / NOT VISIBLE, use 0.0 instead of null.
 
 4. Use section totals ONLY as a sanity check.
    - Bills may show lines like "Total of PATHOLOGY : 10098.00" or "Grand Total : 73420.25".
@@ -232,6 +244,10 @@ VERY IMPORTANT RULES:
 
 6. Every JSON object in bill_items must correspond to exactly ONE visible row
    of the charge table from this page.
+
+7. If the document has multiple tables on the same page, include items from ALL tables
+   (radiology, bed charges, consultation, pathology, pharmacy, etc.) – but still
+   treat each physical row as a separate bill_items entry.
 
 Output format:
 Return STRICT JSON (no markdown, no comments) with exactly this shape:
@@ -253,15 +269,16 @@ Restrictions:
 - Do NOT wrap the JSON in ``` marks.
 - Do NOT add extra keys.
 - Do NOT include subtotals, grand totals, taxes, discounts, or rounding lines as bill_items.
+- All numeric fields must be valid numbers (no null, no empty string).
 """
 
 
-def call_groq_for_page(page_no: int, image_data_url: str):
+def call_groq_for_page(page_no: int, image_data_url: str) -> Tuple[Dict[str, Any], TokenUsage]:
     """
     Call Groq Vision model via Responses API for a single page image.
 
     Returns:
-        parsed_json (dict), token_usage (TokenUsage)
+        (parsed_json_dict, token_usage)
     """
     user_text = f"""
 You are processing page number {page_no}.
@@ -308,16 +325,16 @@ Remember: extract ONLY item-level rows from THIS PAGE.
     # Token usage from Groq Responses API
     usage = getattr(response, "usage", None)
     if usage is not None:
-        total_tokens = getattr(usage, "total_tokens", 0) or 0
-        input_tokens = getattr(usage, "input_tokens", 0) or 0
-        output_tokens = getattr(usage, "output_tokens", 0) or 0
+        total_tokens = int(getattr(usage, "total_tokens", 0) or 0)
+        input_tokens = int(getattr(usage, "input_tokens", 0) or 0)
+        output_tokens = int(getattr(usage, "output_tokens", 0) or 0)
     else:
         total_tokens = input_tokens = output_tokens = 0
 
     token_usage = TokenUsage(
-        total_tokens=int(total_tokens),
-        input_tokens=int(input_tokens),
-        output_tokens=int(output_tokens),
+        total_tokens=total_tokens,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
     )
 
     # Text output
@@ -331,7 +348,7 @@ Remember: extract ONLY item-level rows from THIS PAGE.
         first = raw_text.find("{")
         last = raw_text.rfind("}")
         if first != -1 and last != -1 and last > first:
-            json_str = raw_text[first : last + 1]
+            json_str = raw_text[first: last + 1]
             try:
                 parsed = json.loads(json_str)
             except Exception:
@@ -352,13 +369,63 @@ Remember: extract ONLY item-level rows from THIS PAGE.
 #  Reconcile & Aggregate
 # ============================================================
 
-def reconcile_page_items(page_dict: dict) -> PageItems:
+def _coerce_number(x: Any) -> float:
+    """
+    Coerce a potentially messy numeric value (None, "", "—", etc.) to float.
+    """
+    if x is None:
+        return 0.0
+    if isinstance(x, (int, float)):
+        return float(x)
+    if isinstance(x, str):
+        s = x.strip()
+        if s == "" or s in {"-", "—", "NA", "N/A"}:
+            return 0.0
+        # remove commas in numbers like "52,868.25"
+        s = s.replace(",", "")
+        try:
+            return float(s)
+        except Exception:
+            return 0.0
+    # anything else → 0.0
+    return 0.0
+
+
+def clean_page_dict(page_dict: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Pre-clean the raw JSON dict from the model so that Pydantic parsing will not fail
+    when numeric fields are null/empty/etc.
+    """
+    bill_items = page_dict.get("bill_items", [])
+    cleaned_items = []
+    for item in bill_items:
+        if not isinstance(item, dict):
+            continue
+        cleaned_items.append(
+            {
+                "item_name": str(item.get("item_name", "")).strip(),
+                "item_amount": _coerce_number(item.get("item_amount")),
+                "item_rate": _coerce_number(item.get("item_rate")),
+                "item_quantity": _coerce_number(item.get("item_quantity")),
+            }
+        )
+
+    return {
+        "page_no": str(page_dict.get("page_no", "")),
+        "page_type": str(page_dict.get("page_type", "Bill Detail")),
+        "bill_items": cleaned_items,
+    }
+
+
+def reconcile_page_items(page_dict: Dict[str, Any]) -> PageItems:
     """
     Validate and normalize a single page's JSON dict into PageItems.
     Fix small inconsistencies between rate, qty and amount.
     """
+    cleaned = clean_page_dict(page_dict)
+
     try:
-        page_items = PageItems(**page_dict)
+        page_items = PageItems(**cleaned)
     except Exception as e:
         raise HTTPException(
             status_code=500,
@@ -376,11 +443,9 @@ def reconcile_page_items(page_dict: dict) -> PageItems:
             if math.isfinite(computed) and abs(computed - amount) > EPS:
                 item.item_amount = round(computed, 2)
         elif amount and qty and qty != 0:
-            # Rate missing
             computed_rate = amount / qty
             item.item_rate = round(computed_rate, 4)
         elif amount and (not qty or qty == 0):
-            # Quantity missing
             item.item_quantity = 1.0
             item.item_rate = round(amount, 2)
 
@@ -389,8 +454,8 @@ def reconcile_page_items(page_dict: dict) -> PageItems:
 
 def aggregate_all_pages(pages: List[PageItems]) -> ExtractBillDataResponseData:
     """
-    Compute total_item_count. (Grand total is not required in the official schema,
-    but judges will compute it on their side.)
+    Compute total_item_count. (Grand total is intentionally NOT included,
+    to match the exact Datathon schema.)
     """
     total_items = sum(len(p.bill_items) for p in pages)
     return ExtractBillDataResponseData(
@@ -410,20 +475,20 @@ def extract_bill_data(req: ExtractBillDataRequest):
 
     Request:
         {
-            "document": "<public URL to image or PDF>"
+          "document": "<public URL to image or PDF>"
         }
 
     Response (SUCCESS, 200):
         {
           "is_success": true,
           "token_usage": {
-              "total_tokens": int,
-              "input_tokens": int,
-              "output_tokens": int
+            "total_tokens": int,
+            "input_tokens": int,
+            "output_tokens": int
           },
           "data": {
-              "pagewise_line_items": [...],
-              "total_item_count": int
+            "pagewise_line_items": [...],
+            "total_item_count": int
           }
         }
     """
