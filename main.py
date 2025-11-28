@@ -24,7 +24,7 @@ client = OpenAI(
 )
 
 # Vision model (multimodal) – as you requested
-GROQ_VISION_MODEL_ID = "meta-llama/llama-3.2-90b-vision-instruct"
+GROQ_VISION_MODEL_ID = "meta-llama/llama-4-maverick-17b-128e-instruct"
 
 
 # ============================================================
