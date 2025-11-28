@@ -1,10 +1,10 @@
 # ============================================================
-#  BAJAJ DATATHON – RANK-1 BILL EXTRACTION PIPELINE
-#  Single-file version (Option A)
+#  BAJAJ DATATHON – RANK-1 BILL EXTRACTION PIPELINE (cv2-free)
+#  Single-file version
 #  Includes:
 #   - Multi-crop vision extraction
 #   - PaddleOCR + Tesseract hybrid OCR
-#   - Fraud detection
+#   - Fraud detection (Pillow/NumPy-based)
 #   - Async Groq LLM inference
 #   - Dynamic model switching (Maverick ↔ Scout)
 #   - OCR alignment for qty/rate
@@ -15,7 +15,6 @@
 import os
 import io
 import re
-import cv2
 import json
 import math
 import base64
@@ -68,22 +67,27 @@ class BillItem(BaseModel):
     item_rate: float
     item_quantity: float
 
+
 class PageItems(BaseModel):
     page_no: str
     page_type: str
     bill_items: List[BillItem]
 
+
 class ExtractBillDataRequest(BaseModel):
     document: HttpUrl
+
 
 class ExtractBillDataResponseData(BaseModel):
     pagewise_line_items: List[PageItems]
     total_item_count: int
 
+
 class TokenUsage(BaseModel):
     total_tokens: int
     input_tokens: int
     output_tokens: int
+
 
 class ExtractBillDataResponse(BaseModel):
     is_success: bool
@@ -120,38 +124,30 @@ def guess_mime_type(url: str, content: bytes) -> str:
 
 
 # ============================================================
-#  IMAGE PREPROCESSING
+#  IMAGE PREPROCESSING (cv2-free)
 # ============================================================
 
 def preprocess_image(img: Image.Image) -> Image.Image:
     """
-    Improves OCR + Vision accuracy:
-    - Deskew
-    - Increase contrast
-    - Sharpen edges
-    - Remove noise
+    Improves OCR + Vision accuracy using only Pillow:
+    - Convert to grayscale & auto-contrast
+    - Light unsharp mask (sharpen)
+    - Convert back to RGB
+
+    We intentionally avoid cv2 and any libGL dependencies.
     """
+    # Work in grayscale first
+    gray = img.convert("L")
 
-    # Convert to OpenCV
-    cv_img = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+    # Auto-contrast to stretch dynamic range
+    gray = ImageOps.autocontrast(gray)
 
-    # --- Deskew ---
-    gray = cv2.cvtColor(cv_img, cv2.COLOR_BGR2GRAY)
-    coords = np.column_stack(np.where(gray < 200))
-    if len(coords) > 0:
-        angle = cv2.minAreaRect(coords)[-1]
-        if angle < -45:
-            angle = 90 + angle
-        (h, w) = cv_img.shape[:2]
-        M = cv2.getRotationMatrix2D((w//2, h//2), angle, 1.0)
-        cv_img = cv2.warpAffine(cv_img, M, (w, h), flags=cv2.INTER_CUBIC)
+    # Unsharp mask for edge enhancement (similar to cv2 sharpen)
+    gray = gray.filter(ImageFilter.UnsharpMask(radius=2, percent=150, threshold=3))
 
-    # --- Sharpen ---
-    sharpen = cv2.GaussianBlur(cv_img, (0,0), 3)
-    cv_img = cv2.addWeighted(cv_img, 1.5, sharpen, -0.5, 0)
-
-    # Convert back to PIL
-    return Image.fromarray(cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB))
+    # Convert back to RGB for PaddleOCR / Vision model
+    processed = gray.convert("RGB")
+    return processed
 
 
 # ============================================================
@@ -168,7 +164,7 @@ def run_hybrid_ocr(img: Image.Image) -> Tuple[str, List[Dict]]:
     # Tesseract for printed text
     try:
         tesseract_text = pytesseract.image_to_string(img)
-    except:
+    except Exception:
         tesseract_text = ""
 
     # PaddleOCR for handwriting + complex layouts
@@ -192,19 +188,29 @@ def run_hybrid_ocr(img: Image.Image) -> Tuple[str, List[Dict]]:
 
 
 # ============================================================
-#  FRAUD DETECTION
+#  FRAUD DETECTION (cv2-free)
 # ============================================================
 
 def fraud_score(img: Image.Image) -> float:
     """
     Detect overwritten totals, white patches, unnatural edits.
+    cv2 Laplacian replaced by NumPy gradient-based edge energy.
+
+    Heuristic:
+    - Convert to grayscale
+    - Compute gradient magnitude
+    - Normalize mean gradient to [0,1] range
     """
     gray = np.array(img.convert("L")).astype(float)
 
-    # High-frequency estimate using Laplacian
-    lap = cv2.Laplacian(gray, cv2.CV_64F)
-    score = np.mean(np.abs(lap)) / 50.0
-    return float(min(1.0, max(0.0, score)))
+    # Approximate high-frequency content via spatial gradients
+    gy, gx = np.gradient(gray)
+    edge_mag = np.sqrt(gx ** 2 + gy ** 2)
+
+    # Normalize like original: divide by a constant to keep in [0,1]
+    score = float(np.mean(np.abs(edge_mag)) / 50.0)
+    score = max(0.0, min(1.0, score))
+    return score
 
 
 # ============================================================
@@ -233,10 +239,10 @@ def generate_crops(img: Image.Image, n: int = 3) -> List[Image.Image]:
     """
     w, h = img.size
     crops = []
-    step = h // n
+    step = max(1, h // n)
     for i in range(n):
         top = i * step
-        bottom = h if i == n-1 else (i+1) * step
+        bottom = h if i == n - 1 else (i + 1) * step
         crop = img.crop((0, top, w, bottom))
         crops.append(crop)
     return crops
@@ -251,38 +257,27 @@ def image_to_b64(img: Image.Image) -> str:
     img.save(buf, "JPEG", quality=85)
     data = buf.getvalue()
     q = 85
-    while len(data) > 4*1024*1024 and q > 30:
+    # Groq limit ~4MB per image
+    while len(data) > 4 * 1024 * 1024 and q > 30:
         q -= 10
         buf = io.BytesIO()
         img.save(buf, "JPEG", quality=q)
         data = buf.getvalue()
     return "data:image/jpeg;base64," + base64.b64encode(data).decode()
 
+
 # ============================================================
 #  FASTAPI APP
 # ============================================================
 
 app = FastAPI(
-    title="Bajaj Datathon – Hybrid Bill Extraction API",
+    title="Bajaj Datathon – Hybrid Bill Extraction API (cv2-free)",
     version="4.0.0",
     description=(
         "Hybrid Vision + PaddleOCR + Tesseract + Fraud Detection + "
-        "Multi-crop + Async Groq Inference + Semantic Dedupe"
+        "Multi-crop + Async Groq Inference + Semantic Dedupe (no cv2/libGL)"
     ),
 )
-
-
-# ============================================================
-#  BLANK PAGE DETECTION
-# ============================================================
-
-def is_blank_page(img: Image.Image, ocr_text: str) -> bool:
-    gray = img.convert("L")
-    stat = ImageStat.Stat(gray)
-    mean = stat.mean[0] if stat.mean else 255.0
-    if mean > 245 and len(ocr_text.strip()) < 30:
-        return True
-    return False
 
 
 # ============================================================
@@ -728,10 +723,12 @@ def semantic_dedupe_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             eamt = existing["item_amount"]
 
             name_sim = fuzzy_ratio(name, ename)
-            if name_sim > 0.88 and \
-               abs(qty - eqty) < 0.01 and \
-               abs(rate - erate) < 0.01 and \
-               abs(amt - eamt) < 0.05:
+            if (
+                name_sim > 0.88
+                and abs(qty - eqty) < 0.01
+                and abs(rate - erate) < 0.01
+                and abs(amt - eamt) < 0.05
+            ):
                 is_dup = True
                 break
 
@@ -795,14 +792,13 @@ async def extract_bill_data(req: ExtractBillDataRequest):
     page_infos: List[Dict[str, Any]] = []
 
     for page_idx, raw_img in enumerate(pil_pages, start=1):
-        # Preprocess page
+        # Preprocess page (cv2-free)
         img = preprocess_image(raw_img)
 
         # OCR + fraud
         ocr_text, ocr_boxes = run_hybrid_ocr(img)
-        if is_blank_page(img, ocr_text):
-            continue
 
+        # We REMOVED is_blank_page() as requested → no blank-page skip
         fscore = fraud_score(img)
         page_type = classify_page_type(ocr_text)
         model_name = choose_model(page_type, ocr_text, fscore)
@@ -844,16 +840,16 @@ async def extract_bill_data(req: ExtractBillDataRequest):
     if not tasks:
         return ExtractBillDataResponse(
             is_success=False,
-            message="All pages detected as blank; nothing to extract."
+            message="No crops prepared for LLM extraction."
         )
 
     # 4. Run all LLM calls concurrently
     llm_results = await asyncio.gather(*tasks)
 
     # 5. Aggregate raw items per page
-    page_items_raw: Dict[int, Dict[str, Any]] = {}  # page_idx -> { "page_type": str, "items": [...], "ocr_text": str, "ocr_boxes": [...] }
+    page_items_raw: Dict[int, Dict[str, Any]] = {}  # page_idx -> { "page_type": str, "items": [...] }
 
-    # Map page_idx → ocr_boxes
+    # Map page_idx → ocr_boxes, ocr_text, page_type
     boxes_by_page = {info["page_idx"]: info["ocr_boxes"] for info in page_infos}
     text_by_page = {info["page_idx"]: info["ocr_text"] for info in page_infos}
     type_by_page = {info["page_idx"]: info["page_type"] for info in page_infos}
@@ -930,10 +926,12 @@ async def extract_bill_data(req: ExtractBillDataRequest):
             is_dup = False
             for ex in seen_global:
                 name_sim = fuzzy_ratio(_norm_name(it.item_name), _norm_name(ex.item_name))
-                if name_sim > 0.9 and \
-                   abs(it.item_rate - ex.item_rate) < 0.01 and \
-                   abs(it.item_quantity - ex.item_quantity) < 0.01 and \
-                   abs(it.item_amount - ex.item_amount) < 0.05:
+                if (
+                    name_sim > 0.9
+                    and abs(it.item_rate - ex.item_rate) < 0.01
+                    and abs(it.item_quantity - ex.item_quantity) < 0.01
+                    and abs(it.item_amount - ex.item_amount) < 0.05
+                ):
                     is_dup = True
                     break
             if not is_dup:
