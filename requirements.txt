@@ -1,0 +1,7 @@
+fastapi
+uvicorn[standard]
+requests
+pdf2image
+Pillow
+openai>=1.40.0  # for Responses API client with base_url support
+python-multipart
