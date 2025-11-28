@@ -5,7 +5,7 @@ import json
 import math
 import mimetypes
 import os
-from typing import List
+from typing import List, Optional
 
 import requests
 from fastapi import FastAPI, HTTPException
@@ -15,7 +15,7 @@ from PIL import Image
 from openai import OpenAI
 
 # ============================================================
-#               GROQ CLIENT (OpenAI-Compatible)
+#  Groq Client (OpenAI-compatible)
 # ============================================================
 
 client = OpenAI(
@@ -23,11 +23,14 @@ client = OpenAI(
     base_url="https://api.groq.com/openai/v1",
 )
 
-GROQ_MODEL_ID = "meta-llama/llama-4-maverick-17b-128e-instruct"
+# Vision model (multimodal)
+GROQ_VISION_MODEL_ID = "meta-llama/llama-4-maverick-17b-128e-instruct"
+# If you want a more stable one, uncomment this:
+# GROQ_VISION_MODEL_ID = "meta-llama/llama-3.2-90b-vision-instruct"
 
 
 # ============================================================
-#               Pydantic Schemas
+#  Pydantic Schemas – EXACTLY as per Datathon spec
 # ============================================================
 
 class BillItem(BaseModel):
@@ -60,45 +63,65 @@ class TokenUsage(BaseModel):
 
 class ExtractBillDataResponse(BaseModel):
     is_success: bool
-    token_usage: TokenUsage
-    data: ExtractBillDataResponseData
+    token_usage: Optional[TokenUsage] = None
+    data: Optional[ExtractBillDataResponseData] = None
+    message: Optional[str] = None
 
 
 # ============================================================
-#               FastAPI App
+#  FastAPI App
 # ============================================================
 
 app = FastAPI(
-    title="Bill Data Extraction API (Groq Maverick)",
-    version="2.0.0",
-    description="Extract line items and totals from invoice documents using Groq Llama 4 Maverick.",
+    title="Bajaj Datathon Bill Extraction API",
+    version="1.1.0",
+    description=(
+        "Extracts line items from bill / invoice documents using Groq vision models. "
+        "Implements the exact response schema required by HackRx Datathon."
+    ),
 )
 
 
 # ============================================================
-#               Helpers: Download, Convert, Image Encoding
+#  Helpers – Download & Convert Documents
 # ============================================================
 
 def download_document(url: str) -> bytes:
+    """Download the document from the given URL."""
     try:
-        resp = requests.get(url, timeout=30)
+        resp = requests.get(url, timeout=40)
         resp.raise_for_status()
         return resp.content
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Failed to download document: {e}")
+        raise HTTPException(
+            status_code=400,
+            detail=f"Failed to download document: {e}",
+        )
 
 
-def guess_mime_type(url, content: bytes) -> str:
-    url = str(url)
+def guess_mime_type(url: str, content: bytes) -> str:
+    """
+    Guess mime type based on URL extension or magic bytes.
+    We use URL extension primarily; fall back to simple PDF header check.
+    """
     mime, _ = mimetypes.guess_type(url)
     if mime:
         return mime
+
+    # crude PDF check
     if content[:4] == b"%PDF":
         return "application/pdf"
+
+    # last resort
     return "application/octet-stream"
 
 
 def image_to_data_url(img: Image.Image, quality: int = 85) -> str:
+    """
+    Convert a PIL Image into a base64 JPEG data URL.
+
+    Groq limits base64 images to ~4MB – we adaptively reduce JPEG quality.
+    """
     buf = io.BytesIO()
     img.save(buf, format="JPEG", quality=quality)
     b = buf.getvalue()
@@ -114,112 +137,159 @@ def image_to_data_url(img: Image.Image, quality: int = 85) -> str:
 
 
 def document_to_page_images(url: str, content: bytes) -> List[str]:
-    url = str(url)
+    """
+    Convert the downloaded document into a list of page images,
+    each encoded as base64 data URLs.
+
+    - If image: one page.
+    - If PDF: one image per page.
+    """
     mime = guess_mime_type(url, content)
 
+    # Simple images
     if mime.startswith("image/"):
-        img = Image.open(io.BytesIO(content)).convert("RGB")
+        try:
+            img = Image.open(io.BytesIO(content)).convert("RGB")
+        except Exception as e:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unable to open image document: {e}",
+            )
         return [image_to_data_url(img)]
 
+    # PDFs
     if mime == "application/pdf":
-        pages = convert_from_bytes(content)
-        return [image_to_data_url(p.convert("RGB")) for p in pages]
+        try:
+            pages = convert_from_bytes(content)
+        except Exception as e:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unable to convert PDF to images. "
+                       f"Is poppler installed? Error: {e}",
+            )
+        data_urls: List[str] = []
+        for p in pages:
+            img = p.convert("RGB")
+            data_urls.append(image_to_data_url(img))
+        return data_urls
 
+    # Fallback: try opening as an image anyway
     try:
         img = Image.open(io.BytesIO(content)).convert("RGB")
         return [image_to_data_url(img)]
     except Exception:
-        raise HTTPException(status_code=400, detail=f"Unsupported document type: {mime}")
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported document type: {mime}",
+        )
 
 
 # ============================================================
-#               LLM Prompt
+#  LLM Prompt
 # ============================================================
 
 SYSTEM_PROMPT = """
-You are an expert invoice understanding system. 
-You MUST extract EXACT PER-ROW line items from the given page image. 
+You are an expert medical billing extraction engine.
 
-CRITICAL RULES:
-- Each visible row in the items table MUST become exactly one JSON element. 
-- NEVER merge two different items into one line.
-- NEVER skip any row.
-- NEVER guess values.
-- NEVER swap amounts between items.
-- If two amounts appear (e.g., Rate and Total), use TOTAL as item_amount.
-- item_amount must be EXACTLY the “Total” column value.
-- item_rate must be EXACTLY the “Rate” column value.
-- item_quantity must be EXACTLY the “Qty” column value.
-- If multiple rows look similar, treat them as separate items.
+Goal:
+From a SINGLE PAGE of a bill/invoice image, you must extract ONLY the item-level rows
+from the charges table(s). You must return STRICT JSON according to the given schema.
 
-COLUMN RULES:
-- item_name = EXACT text under Description.
-- item_quantity = numeric Qty.
-- item_rate = numeric Rate.
-- item_amount = numeric Total (NOT Amount column if both exist).
+Definitions:
+- A "line item" is one row in a charge table containing a description (test/procedure/room/etc.),
+  with a quantity, a rate, and a total amount.
+- Ignore patient demographics, addresses, headings like "HOSPITAL", "DETAIL FINAL BILL",
+  and any non-item text.
+- Many bills group items under section headers like "Radiological Investigation",
+  "BED CHARGES", "CONSULTATION", "PATHOLOGY", "PHARMACY CHARGE".
+  Section headers are NOT items.
 
-DO NOT:
-- Merge multiple tests (e.g., RFT + ELECTROLYTES).
-- Swap totals between rows.
-- Infer or guess missing numbers.
+VERY IMPORTANT RULES:
+1. NEVER merge two distinct items into one JSON object.
+   - Example: "RENAL FUNCTION TEST (RFT)" and "ELECTROLYTES" are two separate rows.
 
-OUTPUT:
-Strict JSON with:
+2. NEVER hallucinate nonexistent items.
+   - If you are unsure, leave it out – do NOT invent.
+
+3. Use the numeric columns exactly:
+   - item_quantity = the value under "Qty" or "Qty/Hrs" or equivalent.
+   - item_rate     = the "Rate" column (per unit).
+   - item_amount   = the "Total", "Net Amt", or "Amt (Rs.)" column for that row.
+   - If quantity is clearly missing but there is a total, assume quantity = 1 and rate = total.
+   - If rate is missing but quantity and amount are visible, set rate = amount / quantity.
+
+4. Use section totals ONLY as a sanity check.
+   - Bills may show lines like "Total of PATHOLOGY : 10098.00" or "Grand Total : 73420.25".
+   - Do NOT output these totals as items.
+   - You CAN use them to check if the item_amount values are consistent,
+     but do not include them in the JSON.
+
+5. page_type classification:
+   - "Bill Detail"  → detailed list of investigations/procedures/charges.
+   - "Final Bill"   → summary-style, may still contain many line items plus grand total.
+   - "Pharmacy"    → mostly medicines, drug names, quantity and rate.
+   Choose the best label for THIS page only.
+
+6. Every JSON object in bill_items must correspond to exactly ONE visible row
+   of the charge table from this page.
+
+Output format:
+Return STRICT JSON (no markdown, no comments) with exactly this shape:
+
 {
-  "page_no": "X",
+  "page_no": "<page number as string>",
   "page_type": "<Bill Detail | Final Bill | Pharmacy>",
   "bill_items": [
-     {
-       "item_name": "",
-       "item_amount": float,
-       "item_rate": float,
-       "item_quantity": float
-     }
-   ]
+    {
+      "item_name": "<string>",
+      "item_amount": <float>,
+      "item_rate": <float>,
+      "item_quantity": <float>
+    }
+  ]
 }
+
+Restrictions:
+- Do NOT wrap the JSON in ``` marks.
+- Do NOT add extra keys.
+- Do NOT include subtotals, grand totals, taxes, discounts, or rounding lines as bill_items.
 """
 
 
-# ============================================================
-#               Groq Maverick Vision Call
-# ============================================================
+def call_groq_for_page(page_no: int, image_data_url: str):
+    """
+    Call Groq Vision model via Responses API for a single page image.
 
-def update_usage(acc: dict, response) -> None:
-    """Accumulate token usage from Groq response into acc dict."""
-    usage = getattr(response, "usage", None)
-    if usage is None:
-        return
-
-    # responses API usually exposes total_tokens, input_tokens, output_tokens
-    acc["total_tokens"] += getattr(usage, "total_tokens", 0)
-    acc["input_tokens"] += getattr(usage, "input_tokens", 0)
-    acc["output_tokens"] += getattr(usage, "output_tokens", 0)
-
-
-def call_maverick_for_page(
-    page_no: int,
-    image_data_url: str,
-    usage_acc: dict,
-) -> PageItems:
-    user_prompt = f"""
-This is page number {page_no} of a bill.
-Return JSON with page_no="{page_no}", an appropriate page_type, and the bill_items for THIS PAGE ONLY.
+    Returns:
+        parsed_json (dict), token_usage (TokenUsage)
+    """
+    user_text = f"""
+You are processing page number {page_no}.
+Use page_no="{page_no}" in the JSON.
+Classify page_type as one of: "Bill Detail", "Final Bill", "Pharmacy".
+Remember: extract ONLY item-level rows from THIS PAGE.
 """
 
     try:
         response = client.responses.create(
-            model=GROQ_MODEL_ID,
+            model=GROQ_VISION_MODEL_ID,
             input=[
                 {
                     "role": "system",
                     "content": [
-                        {"type": "input_text", "text": SYSTEM_PROMPT.strip()},
+                        {
+                            "type": "input_text",
+                            "text": SYSTEM_PROMPT.strip(),
+                        }
                     ],
                 },
                 {
                     "role": "user",
                     "content": [
-                        {"type": "input_text", "text": user_prompt.strip()},
+                        {
+                            "type": "input_text",
+                            "text": user_text.strip(),
+                        },
                         {
                             "type": "input_image",
                             "image_url": image_data_url,
@@ -230,123 +300,168 @@ Return JSON with page_no="{page_no}", an appropriate page_type, and the bill_ite
             ],
         )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Groq API error: {e}")
+        raise HTTPException(
+            status_code=503,
+            detail=f"Groq API error: {e}",
+        )
 
-    # accumulate token usage
-    update_usage(usage_acc, response)
+    # Token usage from Groq Responses API
+    usage = getattr(response, "usage", None)
+    if usage is not None:
+        total_tokens = getattr(usage, "total_tokens", 0) or 0
+        input_tokens = getattr(usage, "input_tokens", 0) or 0
+        output_tokens = getattr(usage, "output_tokens", 0) or 0
+    else:
+        total_tokens = input_tokens = output_tokens = 0
 
+    token_usage = TokenUsage(
+        total_tokens=int(total_tokens),
+        input_tokens=int(input_tokens),
+        output_tokens=int(output_tokens),
+    )
+
+    # Text output
     raw_text = response.output_text.strip()
 
-    # Try to parse as pure JSON
+    # Parse JSON robustly
     try:
         parsed = json.loads(raw_text)
     except json.JSONDecodeError:
-        # salvage JSON if wrapped with text
+        # Try to salvage JSON embedded in text
         first = raw_text.find("{")
         last = raw_text.rfind("}")
         if first != -1 and last != -1 and last > first:
-            parsed = json.loads(raw_text[first:last + 1])
+            json_str = raw_text[first : last + 1]
+            try:
+                parsed = json.loads(json_str)
+            except Exception:
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Model response is not valid JSON: {raw_text[:200]}",
+                )
         else:
             raise HTTPException(
                 status_code=500,
                 detail=f"Model response is not valid JSON: {raw_text[:200]}",
             )
 
+    return parsed, token_usage
+
+
+# ============================================================
+#  Reconcile & Aggregate
+# ============================================================
+
+def reconcile_page_items(page_dict: dict) -> PageItems:
+    """
+    Validate and normalize a single page's JSON dict into PageItems.
+    Fix small inconsistencies between rate, qty and amount.
+    """
     try:
-        page_items = PageItems(**parsed)
+        page_items = PageItems(**page_dict)
     except Exception as e:
         raise HTTPException(
             status_code=500,
             detail=f"Model JSON does not match expected schema: {e}",
         )
 
+    EPS = 0.01
+    for item in page_items.bill_items:
+        amount = float(item.item_amount)
+        rate = float(item.item_rate)
+        qty = float(item.item_quantity)
+
+        if rate and qty:
+            computed = rate * qty
+            if math.isfinite(computed) and abs(computed - amount) > EPS:
+                item.item_amount = round(computed, 2)
+        elif amount and qty and qty != 0:
+            # Rate missing
+            computed_rate = amount / qty
+            item.item_rate = round(computed_rate, 4)
+        elif amount and (not qty or qty == 0):
+            # Quantity missing
+            item.item_quantity = 1.0
+            item.item_rate = round(amount, 2)
+
     return page_items
 
 
-# ============================================================
-#               Amount Reconciliation (internal)
-# ============================================================
-
-def reconcile_bill_items(pagewise_items: List[PageItems]) -> ExtractBillDataResponseData:
+def aggregate_all_pages(pages: List[PageItems]) -> ExtractBillDataResponseData:
     """
-    Light consistency cleanup:
-    - If both rate and qty present, fix amount to rate*qty when mismatch.
-    - If amount & qty only, infer rate.
-    - If only amount present, set qty=1 and rate=amount.
-    Final total isn't returned (judges will compute upstream), but we ensure
-    numbers are self-consistent.
+    Compute total_item_count. (Grand total is not required in the official schema,
+    but judges will compute it on their side.)
     """
-    EPS = 0.01
-    total_item_count = 0
-
-    for page in pagewise_items:
-        for item in page.bill_items:
-            total_item_count += 1
-
-            amount = float(item.item_amount)
-            rate = float(item.item_rate)
-            qty = float(item.item_quantity)
-
-            if rate and qty:
-                computed = rate * qty
-                if math.isfinite(computed) and abs(computed - amount) > EPS:
-                    item.item_amount = round(computed, 2)
-            elif amount and qty and qty != 0:
-                item.item_rate = round(amount / qty, 4)
-            elif amount and (not qty or qty == 0):
-                item.item_quantity = 1.0
-                item.item_rate = round(amount, 2)
-
+    total_items = sum(len(p.bill_items) for p in pages)
     return ExtractBillDataResponseData(
-        pagewise_line_items=pagewise_items,
-        total_item_count=total_item_count,
+        pagewise_line_items=pages,
+        total_item_count=total_items,
     )
 
 
 # ============================================================
-#               API Endpoint
+#  API Endpoint
 # ============================================================
 
 @app.post("/extract-bill-data", response_model=ExtractBillDataResponse)
 def extract_bill_data(req: ExtractBillDataRequest):
     """
-    Datathon endpoint.
+    Main Datathon endpoint.
 
     Request:
-    {
-      "document": "<image-or-pdf-url>"
-    }
+        {
+            "document": "<public URL to image or PDF>"
+        }
 
-    Response strictly follows the HackRx spec.
+    Response (SUCCESS, 200):
+        {
+          "is_success": true,
+          "token_usage": {
+              "total_tokens": int,
+              "input_tokens": int,
+              "output_tokens": int
+          },
+          "data": {
+              "pagewise_line_items": [...],
+              "total_item_count": int
+          }
+        }
     """
+    url_str = str(req.document)
 
-    url = str(req.document)
+    # 1. Download document
+    content = download_document(url_str)
 
-    # 1. Download
-    content = download_document(url)
-
-    # 2. Convert to page images
-    page_images = document_to_page_images(url, content)
+    # 2. Convert to per-page images (base64 data URLs)
+    page_images = document_to_page_images(url_str, content)
     if not page_images:
-        raise HTTPException(status_code=400, detail="No pages/images could be extracted from the document.")
+        return ExtractBillDataResponse(
+            is_success=False,
+            message="No pages/images could be extracted from the document.",
+        )
 
-    # 3. Track token usage
-    usage_acc = {"total_tokens": 0, "input_tokens": 0, "output_tokens": 0}
+    all_pages: List[PageItems] = []
+    total_tokens = 0
+    input_tokens = 0
+    output_tokens = 0
 
-    # 4. Run Groq Maverick on each page
-    pagewise_results: List[PageItems] = []
+    # 3. Run Groq Vision model on each page
     for i, img_data_url in enumerate(page_images, start=1):
-        page_result = call_maverick_for_page(page_no=i, image_data_url=img_data_url, usage_acc=usage_acc)
-        pagewise_results.append(page_result)
+        parsed_json, usage = call_groq_for_page(page_no=i, image_data_url=img_data_url)
+        page_items = reconcile_page_items(parsed_json)
+        all_pages.append(page_items)
 
-    # 5. Reconcile numeric fields
-    data = reconcile_bill_items(pagewise_results)
+        total_tokens += usage.total_tokens
+        input_tokens += usage.input_tokens
+        output_tokens += usage.output_tokens
 
-    # 6. Build token usage object
+    # 4. Aggregate
+    data = aggregate_all_pages(all_pages)
+
     token_usage = TokenUsage(
-        total_tokens=usage_acc["total_tokens"],
-        input_tokens=usage_acc["input_tokens"],
-        output_tokens=usage_acc["output_tokens"],
+        total_tokens=total_tokens,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
     )
 
     return ExtractBillDataResponse(
