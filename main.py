@@ -137,47 +137,45 @@ def document_to_page_images(url: str, content: bytes) -> List[str]:
 # ============================================================
 
 SYSTEM_PROMPT = """
-You are an expert system for extracting structured line item data from invoices and bills.
+You are an expert invoice understanding system. 
+You MUST extract EXACT PER-ROW line items from the given page image. 
 
-You will be given a SINGLE PAGE image of a bill. Your job is to:
+CRITICAL RULES:
+- Each visible row in the items table MUST become exactly one JSON element. 
+- NEVER merge two different items into one line.
+- NEVER skip any row.
+- NEVER guess values.
+- NEVER swap amounts between items.
+- If two amounts appear (e.g., Rate and Total), use TOTAL as item_amount.
+- item_amount must be EXACTLY the “Total” column value.
+- item_rate must be EXACTLY the “Rate” column value.
+- item_quantity must be EXACTLY the “Qty” column value.
+- If multiple rows look similar, treat them as separate items.
 
-1. Identify whether this page is:
-   - "Bill Detail"  (itemized services / charges)
-   - "Final Bill"   (summary / consolidated totals)
-   - "Pharmacy"     (medicine items)
-   and set page_type accordingly.
+COLUMN RULES:
+- item_name = EXACT text under Description.
+- item_quantity = numeric Qty.
+- item_rate = numeric Rate.
+- item_amount = numeric Total (NOT Amount column if both exist).
 
-2. Extract ONLY the LINE ITEMS (rows of actual products/services/medicines).
-   Ignore:
-   - headings, category labels, section titles
-   - totals, subtotals, discounts, taxes, balances
-   - patient details, doctor details, addresses, signatures, notes.
+DO NOT:
+- Merge multiple tests (e.g., RFT + ELECTROLYTES).
+- Swap totals between rows.
+- Infer or guess missing numbers.
 
-3. For each line item, extract:
-   - item_name      : exactly as written in the bill (no paraphrasing)
-   - item_quantity  : quantity / units / days (if missing, use 1)
-   - item_rate      : rate per unit (if missing but amount+qty present, use amount/qty)
-   - item_amount    : NET amount for that item, after discounts if visible.
-
-IMPORTANT:
-- Do NOT invent items, numbers, or lines that are not clearly present.
-- Do NOT include subtotal or total rows as separate items.
-- item_amount should generally match item_rate * item_quantity (within normal rounding).
-- If a numeric value is not present, set it to 0.0 instead of guessing.
-
-OUTPUT FORMAT (STRICT JSON, no extra keys, no markdown):
-
+OUTPUT:
+Strict JSON with:
 {
-  "page_no": "<page number as string>",
-  "page_type": "Bill Detail" | "Final Bill" | "Pharmacy",
+  "page_no": "X",
+  "page_type": "<Bill Detail | Final Bill | Pharmacy>",
   "bill_items": [
-    {
-      "item_name": "<string>",
-      "item_amount": <float>,
-      "item_rate": <float>,
-      "item_quantity": <float>
-    }
-  ]
+     {
+       "item_name": "",
+       "item_amount": float,
+       "item_rate": float,
+       "item_quantity": float
+     }
+   ]
 }
 """
 
