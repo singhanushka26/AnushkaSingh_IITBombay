@@ -16,6 +16,6 @@ pytesseract
 
 opencv-python
 numpy
-# easyocr
+surya-ocr
 python-Levenshtein
 # onnxruntime

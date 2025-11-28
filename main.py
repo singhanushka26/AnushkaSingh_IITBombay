@@ -1,36 +1,79 @@
-# main.py
-import base64
+# ============================================================
+#  BAJAJ DATATHON – RANK-1 BILL EXTRACTION PIPELINE (cv2-free)
+#  Tesseract + Surya OCR version
+#  Includes:
+#   - Multi-crop vision extraction
+#   - Tesseract + Surya hybrid OCR
+#   - Fraud detection (Pillow/NumPy-based)
+#   - Async Groq LLM inference
+#   - Dynamic model switching (Maverick ↔ Scout)
+#   - OCR alignment for qty/rate
+#   - Semantic deduplication
+#   - High-recall row reconstruction
+# ============================================================
+
+import os
 import io
+import re
 import json
 import math
+import base64
+import httpx
+import asyncio
+import numpy as np
 import mimetypes
-import os
-from typing import List, Optional, Tuple, Any, Dict
+from typing import List, Dict, Any, Tuple, Optional
 
-import requests
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, HttpUrl
+from PIL import Image, ImageFilter, ImageOps
+import pytesseract
 from pdf2image import convert_from_bytes
-from PIL import Image, ImageStat
-from openai import OpenAI
+from openai import AsyncOpenAI
 
-# ============================================================
-#  Groq Client (OpenAI-compatible)
-# ============================================================
-
-client = OpenAI(
-    api_key=os.environ.get("GROQ_API_KEY"),
-    base_url="https://api.groq.com/openai/v1",
+# --- Surya OCR imports ---
+from surya.ocr import run_ocr
+from surya.model.detection.segformer import (
+    load_model as load_det_model,
+    load_processor as load_det_processor,
+)
+from surya.model.recognition.model import (
+    load_model as load_rec_model,
+)
+from surya.model.recognition.processor import (
+    load_processor as load_rec_processor,
 )
 
-# Vision model (multimodal, good for production)
-GROQ_VISION_MODEL_ID = "meta-llama/llama-4-maverick-17b-128e-instruct"
-# If you want to test Scout instead, change to:
-# GROQ_VISION_MODEL_ID = "meta-llama/llama-4-scout-17b-16e-instruct"
+# Force Surya to CPU by default (can be overridden via env)
+os.environ.setdefault("TORCH_DEVICE", "cpu")
+
+# Load Surya models once at startup
+SURYA_DET_PROCESSOR = load_det_processor()
+SURYA_DET_MODEL = load_det_model()
+SURYA_REC_MODEL = load_rec_model()
+SURYA_REC_PROCESSOR = load_rec_processor()
+SURYA_LANGS = ["en"]  # adjust if you want multi-language OCR
 
 
 # ============================================================
-#  Pydantic Schemas – EXACTLY as per Datathon spec
+#  CONFIG
+# ============================================================
+
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
+
+# Async Groq Client
+groq_client = AsyncOpenAI(
+    api_key=GROQ_API_KEY,
+    base_url="https://api.groq.com/openai/v1"
+)
+
+# Two Vision Models
+MODEL_MAVERICK = "meta-llama/llama-4-maverick-17b-128e-instruct"
+MODEL_SCOUT = "meta-llama/llama-4-scout-17b-16e-instruct"
+
+
+# ============================================================
+#  BASIC SCHEMAS (Datathon Spec)
 # ============================================================
 
 class BillItem(BaseModel):
@@ -42,7 +85,7 @@ class BillItem(BaseModel):
 
 class PageItems(BaseModel):
     page_no: str
-    page_type: str  # "Bill Detail" | "Final Bill" | "Pharmacy"
+    page_type: str
     bill_items: List[BillItem]
 
 
@@ -69,263 +112,248 @@ class ExtractBillDataResponse(BaseModel):
 
 
 # ============================================================
-#  FastAPI App
+#  HELPER: DOWNLOAD FILE (ASYNC)
+# ============================================================
+
+async def download_file(url: str) -> bytes:
+    try:
+        async with httpx.AsyncClient(timeout=45) as client:
+            r = await client.get(url)
+            r.raise_for_status()
+            return r.content
+    except Exception as e:
+        raise HTTPException(400, f"Document download failed: {e}")
+
+
+# ============================================================
+#  MIME GUESS
+# ============================================================
+
+def guess_mime_type(url: str, content: bytes) -> str:
+    mime, _ = mimetypes.guess_type(url)
+    if mime:
+        return mime
+    if content[:4] == b"%PDF":
+        return "application/pdf"
+    return "application/octet-stream"
+
+
+# ============================================================
+#  IMAGE PREPROCESSING (cv2-free)
+# ============================================================
+
+def preprocess_image(img: Image.Image) -> Image.Image:
+    """
+    Same preprocessing idea as before, but cv2-free:
+    - grayscale
+    - autocontrast
+    - unsharp mask
+    - back to RGB
+    """
+    gray = img.convert("L")
+    gray = ImageOps.autocontrast(gray)
+    gray = gray.filter(ImageFilter.UnsharpMask(radius=2, percent=150, threshold=3))
+    return gray.convert("RGB")
+
+
+# ============================================================
+#  HYBRID OCR (Tesseract + Surya)
+# ============================================================
+
+def run_hybrid_ocr(img: Image.Image) -> Tuple[str, List[Dict]]:
+    """
+    Returns:
+        text (str): combined Tesseract + Surya text (for LLM context)
+        boxes (list): list of { "text": str, "bbox": ... } from Surya
+    """
+
+    # --- Tesseract (baseline OCR, often good on clean printed text) ---
+    try:
+        tesseract_text = pytesseract.image_to_string(img)
+    except Exception:
+        tesseract_text = ""
+
+    # --- Surya OCR (line-level, multilingual print-focused OCR) ---
+    try:
+        predictions = run_ocr(
+            [img],               # list of PIL images
+            [SURYA_LANGS],       # list of language lists, one per image
+            SURYA_DET_MODEL,
+            SURYA_DET_PROCESSOR,
+            SURYA_REC_MODEL,
+            SURYA_REC_PROCESSOR,
+        )
+    except Exception:
+        predictions = []
+
+    surya_texts: List[str] = []
+    boxes: List[Dict[str, Any]] = []
+
+    if predictions:
+        page_pred = predictions[0] or {}
+        for line in page_pred.get("text_lines", []):
+            text = line.get("text", "") or ""
+            if not text.strip():
+                continue
+            # Prefer axis-aligned bbox; fallback to polygon
+            bbox = line.get("bbox") or line.get("polygon")
+            surya_texts.append(text)
+            boxes.append({"text": text, "bbox": bbox})
+
+    combined = (tesseract_text or "") + "\n" + "\n".join(surya_texts)
+    return combined.strip(), boxes
+
+
+# ============================================================
+#  FRAUD DETECTION (cv2-free)
+# ============================================================
+
+def fraud_score(img: Image.Image) -> float:
+    """
+    Approximate high-frequency content using NumPy gradients; gives a
+    heuristic for overwriting/patching etc.
+    """
+    gray = np.array(img.convert("L")).astype(float)
+    gy, gx = np.gradient(gray)
+    edge_mag = np.sqrt(gx ** 2 + gy ** 2)
+    score = float(np.mean(edge_mag) / 50.0)
+    return max(0.0, min(1.0, score))
+
+
+# ============================================================
+#  PAGE TYPE CLASSIFICATION
+# ============================================================
+
+def classify_page_type(ocr_text: str) -> str:
+    t = (ocr_text or "").lower()
+
+    if any(x in t for x in ["pharma", "dose", "tablet", "inj", "tab", "caps"]):
+        return "Pharmacy"
+
+    if any(x in t for x in ["final bill", "summary", "net payable", "amount payable"]):
+        return "Final Bill"
+
+    return "Bill Detail"
+
+
+# ============================================================
+#  MULTI-CROP GENERATOR
+# ============================================================
+
+def generate_crops(img: Image.Image, n: int = 3) -> List[Image.Image]:
+    """
+    Split image into N horizontal crops for higher recall.
+    """
+    w, h = img.size
+    step = max(1, h // n)
+    crops = []
+    for i in range(n):
+        top = i * step
+        bottom = h if i == n - 1 else (i + 1) * step
+        crops.append(img.crop((0, top, w, bottom)))
+    return crops
+
+
+# ============================================================
+#  IMAGE → BASE64
+# ============================================================
+
+def image_to_b64(img: Image.Image) -> str:
+    buf = io.BytesIO()
+    img.save(buf, "JPEG", quality=85)
+    data = buf.getvalue()
+    q = 85
+    # keep image under ~4MB for Groq
+    while len(data) > 4 * 1024 * 1024 and q > 30:
+        q -= 10
+        buf = io.BytesIO()
+        img.save(buf, "JPEG", quality=q)
+        data = buf.getvalue()
+    return "data:image/jpeg;base64," + base64.b64encode(data).decode()
+
+
+# ============================================================
+#  FASTAPI APP
 # ============================================================
 
 app = FastAPI(
-    title="Bajaj Datathon Bill Extraction API",
-    version="2.1.0",
+    title="Bajaj Datathon – Hybrid Bill Extraction API (Surya + Tesseract)",
+    version="4.0.0",
     description=(
-        "Extracts line items from bill / invoice documents using Groq vision models "
-        "with optional OCR assistance. Implements the exact response schema "
-        "required by HackRx Datathon."
+        "Hybrid Vision + Surya OCR + Tesseract + Fraud Detection + "
+        "Multi-crop + Async Groq Inference + Semantic Dedupe (no cv2/libGL)"
     ),
 )
 
 
 # ============================================================
-#  Helpers – Download & Convert Documents
+#  ADVANCED SYSTEM PROMPT (same semantics as your original)
 # ============================================================
 
-def download_document(url: str) -> bytes:
-    """
-    Download the document from the given URL.
-    Supports:
-    - Direct image URLs (png, jpg, jpeg, webp, etc.)
-    - Direct PDF URLs
-    - Public file links that resolve to the above
-    """
-    try:
-        resp = requests.get(url, timeout=40)
-        resp.raise_for_status()
-        return resp.content
-    except Exception as e:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Failed to download document: {e}",
-        )
-
-
-def guess_mime_type(url: str, content: bytes) -> str:
-    """
-    Guess mime type based on URL extension or magic bytes.
-    """
-    mime, _ = mimetypes.guess_type(url)
-    if mime:
-        return mime
-
-    if content[:4] == b"%PDF":
-        return "application/pdf"
-
-    return "application/octet-stream"
-
-
-def image_to_data_url(img: Image.Image, quality: int = 85) -> str:
-    """
-    Convert a PIL Image into a base64 JPEG data URL.
-
-    Groq limits base64 images to ~4MB – adaptively reduce JPEG quality.
-    """
-    buf = io.BytesIO()
-    img.save(buf, format="JPEG", quality=quality)
-    b = buf.getvalue()
-
-    # Adaptive compression loop
-    while len(b) > 4 * 1024 * 1024 and quality > 30:
-        quality -= 10
-        buf = io.BytesIO()
-        img.save(buf, format="JPEG", quality=quality)
-        b = buf.getvalue()
-
-    b64 = base64.b64encode(b).decode("utf-8")
-    return f"data:image/jpeg;base64,{b64}"
-
-
-# ---------------- OCR + Blank-page detection ----------------
-
-def extract_ocr_text(img: Image.Image) -> str:
-    """
-    Run Tesseract OCR on the given image.
-
-    If pytesseract or Tesseract is not available, returns "" silently.
-    """
-    try:
-        import pytesseract
-    except Exception:
-        return ""
-
-    try:
-        text = pytesseract.image_to_string(img)
-        return text or ""
-    except Exception:
-        return ""
-
-
-def is_mostly_blank(img: Image.Image, ocr_text: str) -> bool:
-    """
-    Heuristic: detect near-blank pages so we don't send separators/blank scans.
-
-    Criteria:
-    - Very bright (mean grayscale > 245)
-    - AND OCR text length < 30 characters
-    """
-    gray = img.convert("L")
-    stat = ImageStat.Stat(gray)
-    mean = stat.mean[0] if stat.mean else 255.0
-    return bool(mean > 245 and len(ocr_text.strip()) < 30)
-
-
-def document_to_page_infos(url: str, content: bytes) -> List[Dict[str, Any]]:
-    """
-    Convert the downloaded document into a list of PAGE INFOS:
-
-        {
-          "pil_image": <PIL.Image>,
-          "data_url": "data:image/jpeg;base64,...",
-          "ocr_text": "...",
-          "is_blank": bool
-        }
-
-    - If image: one page.
-    - If PDF: one image per page.
-    """
-    mime = guess_mime_type(url, content)
-    page_infos: List[Dict[str, Any]] = []
-
-    # Single images
-    if mime.startswith("image/"):
-        try:
-            img = Image.open(io.BytesIO(content)).convert("RGB")
-        except Exception as e:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Unable to open image document: {e}",
-            )
-
-        ocr_text = extract_ocr_text(img)
-        page_infos.append(
-            {
-                "pil_image": img,
-                "data_url": image_to_data_url(img),
-                "ocr_text": ocr_text,
-                "is_blank": is_mostly_blank(img, ocr_text),
-            }
-        )
-        return page_infos
-
-    # PDFs
-    if mime == "application/pdf":
-        try:
-            pages = convert_from_bytes(content)
-        except Exception as e:
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    "Unable to convert PDF to images. "
-                    "Ensure poppler is installed and available in PATH. "
-                    f"Error: {e}"
-                ),
-            )
-
-        for p in pages:
-            img = p.convert("RGB")
-            ocr_text = extract_ocr_text(img)
-            page_infos.append(
-                {
-                    "pil_image": img,
-                    "data_url": image_to_data_url(img),
-                    "ocr_text": ocr_text,
-                    "is_blank": is_mostly_blank(img, ocr_text),
-                }
-            )
-        return page_infos
-
-    # Fallback: try as image anyway
-    try:
-        img = Image.open(io.BytesIO(content)).convert("RGB")
-    except Exception:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unsupported document type: {mime}",
-        )
-
-    ocr_text = extract_ocr_text(img)
-    page_infos.append(
-        {
-            "pil_image": img,
-            "data_url": image_to_data_url(img),
-            "ocr_text": ocr_text,
-            "is_blank": is_mostly_blank(img, ocr_text),
-        }
-    )
-    return page_infos
-
-
-# ============================================================
-#  LLM Prompt – OCR-aware, strict JSON
-# ============================================================
-
-SYSTEM_PROMPT = """
-You are an expert medical billing extraction engine.
+BASE_SYSTEM_PROMPT = """
+You are an advanced medical bill extraction engine.
 
 Goal:
-From a SINGLE PAGE IMAGE of a bill/invoice, extract ONLY the item-level rows
-from the charges table(s). Return STRICT JSON according to the given schema.
+From a SINGLE PAGE IMAGE (or cropped region of a page) of a bill/invoice,
+extract ONLY item-level rows from the charge/medicine tables and output
+STRICT JSON according to the schema. This cropped region belongs to exactly
+one page of a multi-page bill.
 
 Definitions:
-- A "line item" is one row in a charge table containing a description
-  (test, procedure, medicine, room, bed, etc.) with a quantity, a rate,
-  and a total amount for that row.
-- Ignore patient demographics, addresses, logos, headers like "HOSPITAL",
-  "MEDICOS", "DETAIL FINAL BILL", and any non-item text.
-- Many bills group items under section headers like "Radiological Investigation",
-  "BED CHARGES", "CONSULTATION", "PATHOLOGY", "PHARMACY CHARGE".
-  Section headers are NOT items.
+- A "line item" is ONE row (or logical row) describing a test, procedure,
+  bed/room charge, consultation, or medicine. It usually has:
+  * Description (name of test/procedure/medicine/bed)
+  * Quantity
+  * Rate (per-unit price)
+  * Total/Net amount for that row.
 
-VERY IMPORTANT RULES:
-1. Process ONLY THIS PAGE IMAGE. Do NOT invent rows from other pages.
-   Every JSON row must correspond to a visible row within THIS page image.
+- Ignore patient details, doctor names, hospital headers, logos,
+  addresses, and global bill summary text.
+- Ignore section titles like:
+  "Radiological Investigation", "CONSULTATION", "BED CHARGES",
+  "PHARMACY CHARGE", "PATHOLOGY", etc.
+  These are NOT items.
 
-2. NEVER merge two distinct rows into one JSON object.
-   Example: "RENAL FUNCTION TEST (RFT)" and "ELECTROLYTES" are two separate rows.
+Very important:
+- Every JSON row must correspond to a real, visible row in THIS cropped region.
+- Do NOT invent rows from other pages or crops.
+- If an item row is cut across two crops, you may still extract it from either
+  crop, but do NOT duplicate.
 
-3. NEVER hallucinate nonexistent items.
-   If you are unsure about a row, skip it instead of inventing.
+Page types:
+- "Bill Detail": tests / procedures / bed / investigations line items.
+- "Final Bill": summary-style page, may contain a few line items plus grand total.
+- "Pharmacy": medicines, tablets, injections, bottles, strips.
 
-4. Use the numeric columns exactly:
-   - item_quantity = the value under "Qty", "QTY", "Qty/Hrs", etc.
-   - item_rate     = the "Rate", "RATE" or per-unit price column.
-   - item_amount   = the "Amount", "Net Amt", "Total", "Amt (Rs.)" column.
-   - If quantity is clearly missing but there is a total, assume quantity = 1 and rate = total.
-   - If rate is missing but quantity and amount are visible, set rate = amount / quantity.
-   - If a numeric value is BLANK / NOT VISIBLE, use 0.0 instead of null.
+You MAY be given OCR text for the same region. This OCR can be noisy,
+but it is useful to read very small or blurred numbers. When OCR text is
+provided, prefer exact numbers from OCR if they clearly match the row.
 
-5. Section totals and grand totals:
-   - Rows like "Total of PATHOLOGY", "Total of PHARMACY", "Grand Total",
-     "Net Amount Payable", "SUB TOTAL", "CGST", "SGST", "TAX ON", "ROUND OFF"
-     are NOT items. Do NOT include them in bill_items.
-   - You may use them only mentally to sanity check your amounts.
+Numeric rules:
+- item_quantity = numeric value under columns like "Qty", "QTY/Hrs", "QTY".
+- item_rate     = "Rate", "RATE", "Price", "Per-unit price".
+- item_amount   = "Amount", "Gross", "Net", "Total" for that row.
+- If quantity is missing but a single total is clearly shown for that row,
+  assume quantity = 1 and rate = total.
+- If rate is missing but quantity and amount are visible, set rate = amount / quantity.
+- If a numeric field is not visible / unreadable, set it to 0.0 instead of null.
 
-6. page_type classification:
-   - "Bill Detail"  → detailed list of investigations/procedures/charges.
-   - "Final Bill"   → summary-style, may still contain many line items plus grand total.
-   - "Pharmacy"    → mostly medicines, drug names, quantity and rate.
-   Choose the best label for THIS page only.
+DO NOT include summary rows / totals as items:
+- Lines containing words like: "TOTAL", "SUB TOTAL", "SUBTOTAL",
+  "NET AMOUNT", "AMOUNT PAYABLE", "ROUND OFF", "CGST", "SGST",
+  "IGST", "TAX", "DISC" (discount) must NOT be extracted as line items.
 
-7. Multiple tables:
-   - If the page shows multiple tables (radiology, bed charges, pharmacy, etc.),
-     include items from ALL tables, but still treat each physical row
-     as a separate bill_items entry.
-
-8. Numeric types:
-   - All numeric fields must be valid JSON numbers (no null, no empty strings).
-   - Use period as decimal separator. Do NOT use commas inside numbers.
+Self-check before final output:
+1. Remove any row whose description clearly indicates tax, discount, or totals.
+2. Ensure item_amount ≈ item_rate * item_quantity if all are non-zero.
+   If there is a small mismatch, prefer arithmetic: recompute item_amount
+   as rate * quantity for that row.
+3. Never merge two distinct items into one JSON object.
 
 Output format:
-Return STRICT JSON (no markdown, no comments) with exactly this shape:
+Output ONLY JSON, no markdown, no comments, with shape:
 
 {
-  "page_no": "<page number as string>",
   "page_type": "<Bill Detail | Final Bill | Pharmacy>",
   "bill_items": [
     {
@@ -338,67 +366,97 @@ Return STRICT JSON (no markdown, no comments) with exactly this shape:
 }
 
 Restrictions:
-- Do NOT wrap the JSON in ``` marks.
-- Do NOT add extra keys.
-- Do NOT include subtotals, grand totals, taxes, discounts, or rounding lines as bill_items.
+- Do NOT include any extra top-level fields.
+- Do NOT wrap JSON in ``` fences.
+- Do NOT output intermediate reasoning; just apply it silently.
 """
 
 
-def call_groq_for_page(
-    page_no: int,
-    image_data_url: str,
+def build_system_prompt_for_page(page_type_hint: str) -> str:
+    t = (page_type_hint or "Bill Detail").lower()
+    extra = ""
+
+    if "pharmacy" in t:
+        extra = """
+Pharmacy-specific hints:
+- Items are mostly drug/medicine names, injections, syrups, tablets.
+- Quantities may be strips, bottles, vials, ampoules, etc.
+- Ignore batch numbers / expiry if noisy.
+"""
+    elif "final" in t:
+        extra = """
+Final Bill hints:
+- Many totals present. Avoid extracting any total/tax rows.
+- Page might have very few actual items.
+"""
+    else:
+        extra = """
+Bill Detail hints:
+- Common categories: bed charges, investigations, pathology, procedures.
+- Ignore section headers and subtitles.
+"""
+
+    return BASE_SYSTEM_PROMPT + "\n" + extra
+
+
+# ============================================================
+#  MODEL SELECTION
+# ============================================================
+
+def choose_model(page_type: str, ocr_text: str, fraud: float) -> str:
+    t = (page_type or "").lower()
+    text = (ocr_text or "").lower()
+
+    if "pharmacy" in t:
+        return MODEL_SCOUT
+
+    if any(k in text for k in ["rx", "caps", "syp", "inj", "tab"]) or fraud > 0.45:
+        return MODEL_SCOUT
+
+    return MODEL_MAVERICK
+
+
+# ============================================================
+#  ASYNC GROQ VISION CALL
+# ============================================================
+
+async def call_llm_vision(
+    crop_b64: str,
     ocr_text: str,
+    page_type_hint: str,
+    model_name: str
 ) -> Tuple[Dict[str, Any], TokenUsage]:
-    """
-    Call Groq Vision model for a single page image, with OCR text as hint.
-    """
-    # Truncate OCR text to keep prompt size reasonable
-    ocr_text_snippet = (ocr_text or "").strip()
-    if len(ocr_text_snippet) > 2000:
-        ocr_text_snippet = ocr_text_snippet[:2000]
+    system_prompt = build_system_prompt_for_page(page_type_hint)
+
+    snippet = (ocr_text or "").strip()
+    if len(snippet) > 2000:
+        snippet = snippet[:2000]
 
     user_text = f"""
-You are processing page number {page_no} of a multi-page bill.
+You are extracting line items from ONE cropped region of a bill page.
+Page type: {page_type_hint}
 
-Use page_no="{page_no}" in the JSON.
-Classify page_type as one of: "Bill Detail", "Final Bill", "Pharmacy".
+OCR TEXT (may contain noise):
+{snippet}
 
-Below is OCR text extracted from THIS PAGE ONLY.
-Use it as a hint to read small fonts and numbers, but always match
-it to the visual table rows in the image.
-
-OCR_TEXT_START
-{ocr_text_snippet}
-OCR_TEXT_END
-
-Remember:
-- Extract ONLY item-level rows that are PHYSICALLY PRESENT in THIS PAGE IMAGE.
-- Do NOT carry over rows from previous or next pages.
-"""
+Now silently analyze the crop + OCR and return STRICT JSON.
+""".strip()
 
     try:
-        response = client.responses.create(
-            model=GROQ_VISION_MODEL_ID,
+        response = await groq_client.responses.create(
+            model=model_name,
             input=[
                 {
                     "role": "system",
-                    "content": [
-                        {
-                            "type": "input_text",
-                            "text": SYSTEM_PROMPT.strip(),
-                        }
-                    ],
+                    "content": [{"type": "input_text", "text": system_prompt}],
                 },
                 {
                     "role": "user",
                     "content": [
-                        {
-                            "type": "input_text",
-                            "text": user_text.strip(),
-                        },
+                        {"type": "input_text", "text": user_text},
                         {
                             "type": "input_image",
-                            "image_url": image_data_url,
+                            "image_url": crop_b64,
                             "detail": "auto",
                         },
                     ],
@@ -412,62 +470,46 @@ Remember:
         )
 
     usage = getattr(response, "usage", None)
-    if usage is not None:
-        total_tokens = int(getattr(usage, "total_tokens", 0) or 0)
-        input_tokens = int(getattr(usage, "input_tokens", 0) or 0)
-        output_tokens = int(getattr(usage, "output_tokens", 0) or 0)
+    if usage:
+        token_usage = TokenUsage(
+            total_tokens=int(usage.total_tokens or 0),
+            input_tokens=int(usage.input_tokens or 0),
+            output_tokens=int(usage.output_tokens or 0),
+        )
     else:
-        total_tokens = input_tokens = output_tokens = 0
-
-    token_usage = TokenUsage(
-        total_tokens=total_tokens,
-        input_tokens=input_tokens,
-        output_tokens=output_tokens,
-    )
+        token_usage = TokenUsage(0, 0, 0)
 
     raw_text = response.output_text.strip()
 
-    # Robust JSON parsing
+    # robust JSON parsing
     try:
         parsed = json.loads(raw_text)
-    except json.JSONDecodeError:
-        first = raw_text.find("{")
-        last = raw_text.rfind("}")
-        if first != -1 and last != -1 and last > first:
-            json_str = raw_text[first:last + 1]
-            try:
-                parsed = json.loads(json_str)
-            except Exception:
-                raise HTTPException(
-                    status_code=500,
-                    detail=f"Model response is not valid JSON: {raw_text[:200]}",
-                )
-        else:
+    except Exception:
+        f = raw_text.find("{")
+        l = raw_text.rfind("}")
+        if f == -1 or l == -1 or l <= f:
             raise HTTPException(
                 status_code=500,
-                detail=f"Model response is not valid JSON: {raw_text[:200]}",
+                detail=f"LLM response not valid JSON: {raw_text[:200]}",
             )
+        parsed = json.loads(raw_text[f:l + 1])
 
     return parsed, token_usage
 
 
 # ============================================================
-#  Reconcile, Clean & Aggregate
+#  STRING UTILS – NUMERIC & FUZZY
 # ============================================================
 
 def _coerce_number(x: Any) -> float:
-    """
-    Coerce a potentially messy numeric value (None, "", "—", etc.) to float.
-    """
     if x is None:
         return 0.0
     if isinstance(x, (int, float)):
         return float(x)
     if isinstance(x, str):
-        s = x.strip()
-        if s == "" or s in {"-", "—", "NA", "N/A"}:
+        s = x.strip().replace(",", "")
+        if not s or s in {"-", "—", "NA", "N/A"}:
             return 0.0
-        s = s.replace(",", "")
         try:
             return float(s)
         except Exception:
@@ -475,207 +517,365 @@ def _coerce_number(x: Any) -> float:
     return 0.0
 
 
-def clean_page_dict(page_dict: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Pre-clean the raw JSON dict from the model so that Pydantic parsing will not
-    fail when numeric fields are null/empty/etc.
-    """
-    bill_items = page_dict.get("bill_items", []) or []
-    cleaned_items: List[Dict[str, Any]] = []
+def _norm_name(name: str) -> str:
+    s = (name or "").lower()
+    s = re.sub(r"[^a-z0-9\s]+", " ", s)
+    return re.sub(r"\s+", " ", s).strip()
 
-    for item in bill_items:
-        if not isinstance(item, dict):
+
+def fuzzy_ratio(a: str, b: str) -> float:
+    import difflib
+    return difflib.SequenceMatcher(None, a, b).ratio()
+
+
+# ============================================================
+#  HIGH-RECALL ROW RECONSTRUCTION USING OCR
+# ============================================================
+
+def reconstruct_missing_rows(
+    llm_items: List[Dict[str, Any]],
+    ocr_boxes: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    existing = {_norm_name(i.get("item_name", "")) for i in llm_items}
+    new_items: List[Dict[str, Any]] = []
+
+    for box in ocr_boxes:
+        text = (box.get("text") or "").strip()
+        if len(text) < 3:
             continue
-        cleaned_items.append(
-            {
-                "item_name": str(item.get("item_name", "")).strip(),
-                "item_amount": _coerce_number(item.get("item_amount")),
-                "item_rate": _coerce_number(item.get("item_rate")),
-                "item_quantity": _coerce_number(item.get("item_quantity")),
-            }
-        )
 
-    return {
-        "page_no": str(page_dict.get("page_no", "")),
-        "page_type": str(page_dict.get("page_type", "Bill Detail")),
-        "bill_items": cleaned_items,
-    }
+        lw = text.lower()
+        if any(k in lw for k in ["total", "cgst", "sgst", "igst", "round", "gst", "tax", "sub total", "subtotal"]):
+            continue
+
+        norm = _norm_name(text)
+        if not norm or norm in existing:
+            continue
+
+        existing.add(norm)
+        new_items.append({
+            "item_name": text,
+            "item_amount": 0.0,
+            "item_rate": 0.0,
+            "item_quantity": 0.0,
+        })
+
+    return llm_items + new_items
 
 
-def reconcile_page_items(page_dict: Dict[str, Any]) -> PageItems:
-    """
-    Validate and normalize a single page's JSON dict into PageItems.
-    Fix small inconsistencies between rate, qty and amount.
-    """
-    cleaned = clean_page_dict(page_dict)
+# ============================================================
+#  OCR ALIGNMENT FOR QTY/RATE/AMOUNT
+# ============================================================
 
-    try:
-        page_items = PageItems(**cleaned)
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Model JSON does not match expected schema: {e}",
-        )
+def align_numbers_with_ocr(
+    items: List[Dict[str, Any]],
+    ocr_text: str
+) -> List[Dict[str, Any]]:
+    lines = [ln.strip() for ln in (ocr_text or "").splitlines() if ln.strip()]
+    out: List[Dict[str, Any]] = []
 
+    for it in items:
+        name = it.get("item_name", "")
+        norm = _norm_name(name)
+
+        qty = _coerce_number(it.get("item_quantity"))
+        rate = _coerce_number(it.get("item_rate"))
+        amt = _coerce_number(it.get("item_amount"))
+
+        # already complete
+        if qty > 0 and rate > 0 and amt > 0:
+            out.append({
+                "item_name": name,
+                "item_amount": amt,
+                "item_rate": rate,
+                "item_quantity": qty,
+            })
+            continue
+
+        best_line = None
+        best_score = 0.0
+
+        for ln in lines:
+            score = fuzzy_ratio(norm, _norm_name(ln))
+            if score > best_score:
+                best_score = score
+                best_line = ln
+
+        if best_line and best_score > 0.6:
+            nums = re.findall(r"\d+\.?\d*", best_line)
+            nums_f = [float(n) for n in nums] if nums else []
+
+            if len(nums_f) >= 1 and amt == 0.0:
+                amt = nums_f[-1]
+            if len(nums_f) >= 2 and rate == 0.0:
+                rate = nums_f[-2]
+            if len(nums_f) >= 3 and qty == 0.0:
+                qty = nums_f[0]
+
+        out.append({
+            "item_name": name,
+            "item_amount": amt,
+            "item_rate": rate,
+            "item_quantity": qty,
+        })
+
+    return out
+
+
+# ============================================================
+#  RECONCILE NUMERIC CONSISTENCY
+# ============================================================
+
+def reconcile_items_numeric(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     EPS = 0.01
-    for item in page_items.bill_items:
-        amount = float(item.item_amount)
-        rate = float(item.item_rate)
-        qty = float(item.item_quantity)
+    out: List[Dict[str, Any]] = []
+
+    for it in items:
+        name = it.get("item_name", "")
+        qty = _coerce_number(it.get("item_quantity"))
+        rate = _coerce_number(it.get("item_rate"))
+        amt = _coerce_number(it.get("item_amount"))
 
         if rate and qty:
             computed = rate * qty
-            if math.isfinite(computed) and abs(computed - amount) > EPS:
-                # Trust arithmetic over noisy OCR when there is a big mismatch
-                item.item_amount = round(computed, 2)
-        elif amount and qty and qty != 0:
-            computed_rate = amount / qty
-            item.item_rate = round(computed_rate, 4)
-        elif amount and (not qty or qty == 0):
-            item.item_quantity = 1.0
-            item.item_rate = round(amount, 2)
+            if math.isfinite(computed) and abs(computed - amt) > EPS:
+                amt = round(computed, 2)
+        elif amt and qty and qty != 0:
+            rate = round(amt / qty, 4)
+        elif amt and not qty:
+            qty = 1.0
+            rate = amt
 
-    return page_items
+        out.append({
+            "item_name": name.strip(),
+            "item_amount": float(amt),
+            "item_rate": float(rate),
+            "item_quantity": float(qty),
+        })
 
-
-def dedupe_all_pages(pages: List[PageItems]) -> List[PageItems]:
-    """
-    De-duplicate clearly repeated items across pages.
-
-    We treat items with the same:
-        (page_type, normalized_name, rate, qty, amount)
-    as duplicates and keep only the first occurrence.
-    """
-    seen: set = set()
-    deduped_pages: List[PageItems] = []
-
-    for p in pages:
-        new_items: List[BillItem] = []
-        for item in p.bill_items:
-            key = (
-                p.page_type,
-                item.item_name.strip().lower(),
-                round(float(item.item_rate), 2),
-                round(float(item.item_quantity), 2),
-                round(float(item.item_amount), 2),
-            )
-            if key in seen:
-                # duplicate – likely repetition of the same list
-                continue
-            seen.add(key)
-            new_items.append(item)
-
-        p.bill_items = new_items
-        deduped_pages.append(p)
-
-    return deduped_pages
-
-
-def aggregate_all_pages(pages: List[PageItems]) -> ExtractBillDataResponseData:
-    """
-    Compute total_item_count. Grand total is intentionally NOT included,
-    to match the exact Datathon schema.
-    """
-    total_items = sum(len(p.bill_items) for p in pages)
-    return ExtractBillDataResponseData(
-        pagewise_line_items=pages,
-        total_item_count=total_items,
-    )
+    return out
 
 
 # ============================================================
-#  API Endpoint
+#  SEMANTIC DEDUPLICATION (WITHIN PAGE)
+# ============================================================
+
+def semantic_dedupe_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    deduped: List[Dict[str, Any]] = []
+
+    for it in items:
+        name_norm = _norm_name(it["item_name"])
+        qty = _coerce_number(it["item_quantity"])
+        rate = _coerce_number(it["item_rate"])
+        amt = _coerce_number(it["item_amount"])
+
+        is_dup = False
+        for ex in deduped:
+            if (
+                fuzzy_ratio(name_norm, _norm_name(ex["item_name"])) > 0.88
+                and abs(qty - ex["item_quantity"]) < 0.01
+                and abs(rate - ex["item_rate"]) < 0.01
+                and abs(amt - ex["item_amount"]) < 0.05
+            ):
+                is_dup = True
+                break
+
+        if not is_dup:
+            deduped.append({
+                "item_name": it["item_name"],
+                "item_amount": amt,
+                "item_rate": rate,
+                "item_quantity": qty,
+            })
+
+    return deduped
+
+
+# ============================================================
+#  MAIN ENDPOINT
 # ============================================================
 
 @app.post("/extract-bill-data", response_model=ExtractBillDataResponse)
-def extract_bill_data(req: ExtractBillDataRequest):
+async def extract_bill_data(req: ExtractBillDataRequest):
     """
-    Main Datathon endpoint.
-
-    Request:
-        {
-          "document": "<public URL to image or PDF>"
-        }
-
-    Response (SUCCESS, 200):
-        {
-          "is_success": true,
-          "token_usage": {
-            "total_tokens": int,
-            "input_tokens": int,
-            "output_tokens": int
-          },
-          "data": {
-            "pagewise_line_items": [...],
-            "total_item_count": int
-          }
-        }
+    Datathon API:
+    {
+        "document": "<public PDF/image URL>"
+    }
     """
-    url_str = str(req.document)
+    url = str(req.document)
 
-    # 1. Download document
-    content = download_document(url_str)
+    # 1. Download
+    content = await download_file(url)
+    mime = guess_mime_type(url, content)
 
-    # 2. Convert to per-page infos (image + data_url + OCR)
-    page_infos = document_to_page_infos(url_str, content)
-    if not page_infos:
+    # 2. Load pages
+    if mime == "application/pdf":
+        try:
+            pages = convert_from_bytes(content)
+        except Exception as e:
+            raise HTTPException(400, f"PDF conversion failed: {e}")
+    else:
+        try:
+            pages = [Image.open(io.BytesIO(content)).convert("RGB")]
+        except Exception as e:
+            raise HTTPException(400, f"Image open failed: {e}")
+
+    if not pages:
         return ExtractBillDataResponse(
             is_success=False,
-            message="No pages/images could be extracted from the document.",
+            message="No pages found in document."
         )
 
-    all_pages: List[PageItems] = []
-    total_tokens = 0
-    input_tokens = 0
-    output_tokens = 0
+    tasks: List[asyncio.Future] = []
+    meta: List[Dict[str, Any]] = []
+    global_usage = TokenUsage(0, 0, 0)
 
-    # 3. Run Groq Vision model on each NON-BLANK page
-    logical_page_no = 1
-    for info in page_infos:
-        if info.get("is_blank"):
-            # Skip obviously blank pages
-            continue
+    page_infos: List[Dict[str, Any]] = []
 
-        data_url = info["data_url"]
-        ocr_text = info.get("ocr_text", "")
+    # 3. Per-page: preprocess → OCR → fraud → model selection → crops → LLM tasks
+    for page_idx, raw_page in enumerate(pages, start=1):
+        img = preprocess_image(raw_page)
 
-        parsed_json, usage = call_groq_for_page(
-            page_no=logical_page_no,
-            image_data_url=data_url,
-            ocr_text=ocr_text,
+        ocr_text, ocr_boxes = run_hybrid_ocr(img)
+        fscore = fraud_score(img)
+        page_type = classify_page_type(ocr_text)
+        model = choose_model(page_type, ocr_text, fscore)
+
+        page_infos.append({
+            "page_idx": page_idx,
+            "img": img,
+            "ocr_text": ocr_text,
+            "ocr_boxes": ocr_boxes,
+            "page_type": page_type,
+            "model": model,
+        })
+
+        crops = generate_crops(
+            img,
+            n=3 if page_type != "Pharmacy" else 4,
         )
 
-        page_items = reconcile_page_items(parsed_json)
-        # Ensure page_no is consistent with our logical numbering
-        page_items.page_no = str(logical_page_no)
-        all_pages.append(page_items)
+        for crop_idx, crop in enumerate(crops, start=1):
+            crop_b64 = image_to_b64(crop)
+            tasks.append(
+                call_llm_vision(
+                    crop_b64=crop_b64,
+                    ocr_text=ocr_text,
+                    page_type_hint=page_type,
+                    model_name=model,
+                )
+            )
+            meta.append({
+                "page_idx": page_idx,
+                "crop_idx": crop_idx,
+                "page_type": page_type,
+                "ocr_text": ocr_text,
+            })
 
-        total_tokens += usage.total_tokens
-        input_tokens += usage.input_tokens
-        output_tokens += usage.output_tokens
-
-        logical_page_no += 1
-
-    if not all_pages:
+    if not tasks:
         return ExtractBillDataResponse(
             is_success=False,
-            message="All pages were detected as blank; nothing to extract.",
+            message="No crops generated."
         )
 
-    # 4. De-duplicate obviously repeated items across pages
-    all_pages = dedupe_all_pages(all_pages)
+    # 4. Run all LLM calls concurrently
+    results = await asyncio.gather(*tasks)
 
-    # 5. Aggregate
-    data = aggregate_all_pages(all_pages)
+    # 5. Aggregate by page
+    page_items_raw: Dict[int, Dict[str, Any]] = {}
+    text_by_page = {p["page_idx"]: p["ocr_text"] for p in page_infos}
+    boxes_by_page = {p["page_idx"]: p["ocr_boxes"] for p in page_infos}
+    type_by_page = {p["page_idx"]: p["page_type"] for p in page_infos}
 
-    token_usage = TokenUsage(
-        total_tokens=total_tokens,
-        input_tokens=input_tokens,
-        output_tokens=output_tokens,
-    )
+    for (parsed, usage), m in zip(results, meta):
+        page_idx = m["page_idx"]
+
+        global_usage.total_tokens += usage.total_tokens
+        global_usage.input_tokens += usage.input_tokens
+        global_usage.output_tokens += usage.output_tokens
+
+        items = parsed.get("bill_items", []) or []
+
+        if page_idx not in page_items_raw:
+            page_items_raw[page_idx] = {
+                "page_type": type_by_page[page_idx],
+                "items": [],
+            }
+
+        page_items_raw[page_idx]["items"].extend(items)
+
+    # 6. Page-level post-processing
+    final_pages: List[PageItems] = []
+
+    for page_idx, info in page_items_raw.items():
+        page_type = info["page_type"]
+        items = info["items"]
+
+        ocr_text = text_by_page.get(page_idx, "")
+        ocr_boxes = boxes_by_page.get(page_idx, [])
+
+        items = reconstruct_missing_rows(items, ocr_boxes)
+        items = align_numbers_with_ocr(items, ocr_text)
+        items = reconcile_items_numeric(items)
+        items = semantic_dedupe_items(items)
+
+        cleaned: List[BillItem] = []
+        for it in items:
+            nm = (it["item_name"] or "").strip()
+            lower = nm.lower()
+            if any(k in lower for k in [
+                "total", "cgst", "sgst", "igst", "round",
+                "gst", "tax", "sub total", "subtotal"
+            ]):
+                continue
+
+            cleaned.append(BillItem(
+                item_name=nm,
+                item_amount=_coerce_number(it["item_amount"]),
+                item_rate=_coerce_number(it["item_rate"]),
+                item_quantity=_coerce_number(it["item_quantity"]),
+            ))
+
+        final_pages.append(PageItems(
+            page_no=str(page_idx),
+            page_type=page_type,
+            bill_items=cleaned,
+        ))
+
+    # 7. Global dedupe across pages (avoid duplicate scan entries)
+    deduped_pages: List[PageItems] = []
+    seen: List[BillItem] = []
+
+    for pg in final_pages:
+        new_items: List[BillItem] = []
+        for it in pg.bill_items:
+            dup = False
+            for ex in seen:
+                if (
+                    fuzzy_ratio(_norm_name(it.item_name), _norm_name(ex.item_name)) > 0.9
+                    and abs(it.item_rate - ex.item_rate) < 0.01
+                    and abs(it.item_quantity - ex.item_quantity) < 0.01
+                    and abs(it.item_amount - ex.item_amount) < 0.05
+                ):
+                    dup = True
+                    break
+
+            if not dup:
+                seen.append(it)
+                new_items.append(it)
+
+        pg.bill_items = new_items
+        deduped_pages.append(pg)
+
+    # 8. Final aggregation
+    total_items = sum(len(p.bill_items) for p in deduped_pages)
 
     return ExtractBillDataResponse(
         is_success=True,
-        token_usage=token_usage,
-        data=data,
+        token_usage=global_usage,
+        data=ExtractBillDataResponseData(
+            pagewise_line_items=deduped_pages,
+            total_item_count=total_items,
+        ),
     )
