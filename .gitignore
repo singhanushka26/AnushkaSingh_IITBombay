@@ -1,2 +1,92 @@
-.venv
-__pycache__
+# =============================
+# Python
+# =============================
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pdb
+*.egg-info/
+*.egg
+*.manifest
+*.spec
+
+# =============================
+# Virtual Environment
+# =============================
+.venv/
+env/
+venv/
+ENV/
+
+# =============================
+# Bytecode & Cache
+# =============================
+*.log
+*.pot
+*.pyc
+*.pyo
+*.pyd
+*.cache/
+*.pytest_cache/
+.cache/
+.mypy_cache/
+.pytest_cache/
+
+# =============================
+# OS Specific
+# =============================
+.DS_Store
+Thumbs.db
+
+# =============================
+# FastAPI / Uvicorn
+# =============================
+*.sqlite3
+instance/
+uploads/
+*.db
+
+# =============================
+# Environment Variables
+# =============================
+.env
+.env.*
+*.token
+*.secret
+*.key
+
+# =============================
+# Jupyter
+# =============================
+.ipynb_checkpoints/
+
+# =============================
+# VS Code
+# =============================
+.vscode/
+*.code-workspace
+
+# =============================
+# PDFs, temp files
+# =============================
+*.pdf
+*.png
+*.jpg
+*.jpeg
+*.tmp
+
+# =============================
+# Build artifacts
+# =============================
+build/
+dist/
+*.egg-info/
+*.tar.gz
+*.whl
+
+# =============================
+# Logs
+# =============================
+*.log
+logs/
