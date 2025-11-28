@@ -1,25 +1,20 @@
-fastapi==0.110.0
-uvicorn[standard]==0.27.1
+fastapi
+uvicorn[standard]
+requests
+pdf2image
+Pillow
+openai>=1.40.0  # for Responses API client with base_url support
+python-multipart
 
-# OCR
-pytesseract==0.3.10
-easyocr==1.7.1
-Pillow==10.2.0
-pdf2image==1.17.0
 
-# Torch CPU (required by EasyOCR)
-torch==2.1.0
-torchvision==0.16.0
+httpx
+pydantic
 
-# HTTP + Utils
-httpx==0.27.0
-numpy==1.26.4
+paddlepaddle
+paddleocr
+pytesseract
 
-# Groq LLM API client
-openai==1.54.3
-
-# Pydantic
-pydantic==2.7.4
-
-# For fuzzy matching
-python-Levenshtein==0.25.0
+opencv-python
+numpy
+easyocr
+python-Levenshtein
