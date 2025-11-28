@@ -276,8 +276,13 @@ app = FastAPI(
 #  BLANK PAGE DETECTION
 # ============================================================
 
-def is_blank_page(img: Image.Image, ocr_text: str) -> bool:
-    continue
+# def is_blank_page(img: Image.Image, ocr_text: str) -> bool:
+#     gray = img.convert("L")
+#     stat = ImageStat.Stat(gray)
+#     mean = stat.mean[0] if stat.mean else 255.0
+#     if mean > 245 and len(ocr_text.strip()) < 30:
+#         return True
+#     return False
 
 
 # ============================================================
@@ -795,8 +800,7 @@ async def extract_bill_data(req: ExtractBillDataRequest):
 
         # OCR + fraud
         ocr_text, ocr_boxes = run_hybrid_ocr(img)
-        if is_blank_page(img, ocr_text):
-            continue
+        
 
         fscore = fraud_score(img)
         page_type = classify_page_type(ocr_text)
