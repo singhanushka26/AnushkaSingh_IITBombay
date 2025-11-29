@@ -96,13 +96,15 @@ def download_document(url: str) -> bytes:
         raise HTTPException(400, f"Failed to download document: {e}")
 
 
-def guess_mime(url: str, content: bytes) -> str:
+def guess_mime(url: str | HttpUrl, content: bytes) -> str:
+    url = str(url)
     mime, _ = mimetypes.guess_type(url)
     if mime:
         return mime
     if content[:4] == b"%PDF":
         return "application/pdf"
     return "application/octet-stream"
+
 
 
 def enhance(img: Image.Image) -> Image.Image:
@@ -136,7 +138,8 @@ def img_to_dataurl(img: Image.Image) -> str:
     return "data:image/jpeg;base64," + base64.b64encode(data).decode()
 
 
-def document_to_images(url: str, content: bytes) -> List[str]:
+def document_to_images(url: str | HttpUrl, content: bytes) -> List[str]:
+    url = str(url)
     mime = guess_mime(url, content)
 
     if mime.startswith("image/"):
@@ -147,9 +150,9 @@ def document_to_images(url: str, content: bytes) -> List[str]:
         pages = convert_from_bytes(content)
         return [img_to_dataurl(p.convert("RGB")) for p in pages]
 
-    # fallback
     img = Image.open(io.BytesIO(content)).convert("RGB")
     return [img_to_dataurl(img)]
+
 
 
 # ------------------------------------------------------------
@@ -399,7 +402,7 @@ def extract_api(req: ExtractBillDataRequest):
     t0 = time.time()
 
     content = download_document(req.document)
-    imgs = document_to_images(req.document, content)
+    imgs = document_to_images(str(req.document), content)
     n = len(imgs)
 
     pages: List[PageItems] = []
