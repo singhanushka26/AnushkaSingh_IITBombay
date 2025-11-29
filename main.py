@@ -5,6 +5,7 @@ import json
 import math
 import mimetypes
 import os
+import re
 import time
 from typing import List, Optional, Tuple, Any, Dict, Set
 
@@ -76,11 +77,11 @@ class ExtractBillDataResponse(BaseModel):
 
 app = FastAPI(
     title="Bajaj Datathon Bill Extraction API",
-    version="6.0.0",
+    version="6.1.0",
     description=(
         "Hybrid Scout + Maverick pipeline with batching (<=5 images per "
         "request) and suspicious-page recovery for high accuracy while "
-        "staying within latency limits."
+        "staying within latency limits. Includes robust JSON repair."
     ),
 )
 
@@ -318,32 +319,61 @@ Return ONE strict JSON object ONLY:
 
 
 # ============================================================
-#  Groq Call Helpers
+#  JSON Repair + Parsing
 # ============================================================
+
+def _repair_json_string(s: str) -> str:
+    """
+    Try to fix common LLM JSON mistakes:
+
+    - Numbers like 3000.  -> 3000.0
+    - Trailing commas before } or ]
+    - Strip stray leading/trailing text outside the outermost { ... }
+    """
+    txt = s.strip()
+
+    # Keep only the substring from first '{' to last '}'
+    first = txt.find("{")
+    last = txt.rfind("}")
+    if first != -1 and last != -1 and last > first:
+        txt = txt[first:last + 1]
+
+    # Fix numbers like 3000. (no digit after the dot)
+    # Pattern: integer followed by '.' not followed by a digit
+    txt = re.sub(r'(?P<num>-?\d+)\.(?=\D)', r'\g<num>.0', txt)
+
+    # Remove trailing commas before } or ]
+    txt = re.sub(r',(\s*[\]}])', r'\1', txt)
+
+    return txt
+
 
 def _parse_groq_json(raw_text: str) -> dict:
     raw = raw_text.strip()
 
     # Strip accidental markdown fences
     if raw.startswith("```"):
-        # remove first/last occurrence of ```
+        # Remove leading and trailing ``` blocks
         raw = raw.strip("`")
 
+    # First attempt: direct parse
     try:
         return json.loads(raw)
     except json.JSONDecodeError:
-        first = raw.find("{")
-        last = raw.rfind("}")
-        if first != -1 and last != -1 and last > first:
-            try:
-                return json.loads(raw[first:last + 1])
-            except Exception:
-                pass
-        raise HTTPException(
-            status_code=500,
-            detail=f"Model response is not valid JSON: {raw[:200]}",
-        )
+        # Try with repair
+        repaired = _repair_json_string(raw)
+        try:
+            return json.loads(repaired)
+        except json.JSONDecodeError:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Model response is not valid JSON: {repaired[:200]}",
+            )
 
+
+# ============================================================
+#  Groq Call Helpers
+# ============================================================
 
 def call_groq_for_batch_fast(
     batch_page_infos: List[Dict[str, Any]],
