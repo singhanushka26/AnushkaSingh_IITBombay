@@ -5,7 +5,7 @@ import json
 import math
 import mimetypes
 import os
-from typing import List, Optional, Tuple, Any, Dict
+from typing import List, Optional, Tuple, Any, Dict, Set
 
 import requests
 from fastapi import FastAPI, HTTPException
@@ -24,12 +24,14 @@ client = OpenAI(
 )
 
 # Vision model (multimodal, good for production)
-GROQ_VISION_MODEL_ID = "meta-llama/llama-4-maverick-17b-128e-instruct"
-# If you want to test Scout instead, change to:
-# GROQ_VISION_MODEL_ID = "meta-llama/llama-4-scout-17b-16e-instruct"
+# For maximum accuracy we keep Maverick as default.
+GROQ_VISION_MODEL_ID = os.environ.get(
+    "GROQ_VISION_MODEL_ID",
+    "meta-llama/llama-4-maverick-17b-128e-instruct",
+)
 
-# High-recall mode: number of crops per page
-NUM_CROPS_PER_PAGE = 3  # top / middle / bottom slices
+# Hard accuracy mode (single full-page call, strong prompt)
+HARD_ACCURACY_MODE = True  # keep True for Datathon
 
 
 # ============================================================
@@ -76,12 +78,13 @@ class ExtractBillDataResponse(BaseModel):
 # ============================================================
 
 app = FastAPI(
-    title="Bajaj Datathon Bill Extraction API – High Recall",
+    title="Bajaj Datathon Bill Extraction API",
     version="3.0.0",
     description=(
-        "High-recall extraction of line items from bill / invoice documents "
-        "using Groq LLaMA-4 Vision with Tesseract OCR assistance. "
-        "Multi-crop per page, repeated row-preserving, Datathon schema compliant."
+        "Extracts line items from bill / invoice documents using Groq vision models "
+        "with Tesseract OCR assistance. Implements the exact response schema "
+        "required by HackRx Datathon and is tuned to minimize missed items and "
+        "double counting while matching the printed bill totals."
     ),
 )
 
@@ -123,18 +126,35 @@ def guess_mime_type(url: str, content: bytes) -> str:
     return "application/octet-stream"
 
 
-def image_to_data_url(img: Image.Image, quality: int = 85) -> str:
+def _resize_for_vision(img: Image.Image, max_dim: int = 1600) -> Image.Image:
+    """
+    Light downscale to reduce tokens & latency while keeping details.
+    Keeps aspect ratio. Only downsizes if larger than max_dim.
+    """
+    w, h = img.size
+    scale = max(w, h) / float(max_dim)
+    if scale <= 1.0:
+        return img
+    new_w = int(w / scale)
+    new_h = int(h / scale)
+    return img.resize((new_w, new_h), Image.LANCZOS)
+
+
+def image_to_data_url(img: Image.Image, quality: int = 80) -> str:
     """
     Convert a PIL Image into a base64 JPEG data URL.
 
     Groq limits base64 images to ~4MB – adaptively reduce JPEG quality.
     """
+    # Optional resize for speed/token control
+    img = _resize_for_vision(img, max_dim=1600)
+
     buf = io.BytesIO()
     img.save(buf, format="JPEG", quality=quality)
     b = buf.getvalue()
 
     # Adaptive compression loop
-    while len(b) > 4 * 1024 * 1024 and quality > 30:
+    while len(b) > 4 * 1024 * 1024 and quality > 40:
         quality -= 10
         buf = io.BytesIO()
         img.save(buf, format="JPEG", quality=quality)
@@ -166,14 +186,27 @@ def extract_ocr_text(img: Image.Image) -> str:
 
 def is_mostly_blank(img: Image.Image, ocr_text: str) -> bool:
     """
-    For high-recall mode we disable blank skipping by always returning False.
+    Very conservative blank-page detector:
+    - High brightness AND
+    - very low variance AND
+    - almost no OCR text
 
-    If you ever want blank detection back, use something like:
-        gray = img.convert("L")
-        stat = ImageStat.Stat(gray)
-        mean = stat.mean[0] if stat.mean else 255.0
-        return bool(mean > 245 and len(ocr_text.strip()) < 30)
+    To avoid missing any bill content, this function errs on the side
+    of treating pages as NON-blank.
     """
+    # If there is any non-trivial OCR text, treat as non-blank
+    if len((ocr_text or "").strip()) > 50:
+        return False
+
+    gray = img.convert("L")
+    stat = ImageStat.Stat(gray)
+    mean = stat.mean[0] if stat.mean else 255.0
+    var = stat.var[0] if stat.var else 0.0
+
+    # Very bright, very low-variance, and almost no text
+    if mean > 248 and var < 5.0 and len((ocr_text or "").strip()) < 10:
+        return True
+
     return False
 
 
@@ -183,7 +216,7 @@ def document_to_page_infos(url: str, content: bytes) -> List[Dict[str, Any]]:
 
         {
           "pil_image": <PIL.Image>,
-          "data_url": "data:image/jpeg;base64,...",  # full page
+          "data_url": "data:image/jpeg;base64,...",
           "ocr_text": "...",
           "is_blank": bool
         }
@@ -210,6 +243,7 @@ def document_to_page_infos(url: str, content: bytes) -> List[Dict[str, Any]]:
                 "pil_image": img,
                 "data_url": image_to_data_url(img),
                 "ocr_text": ocr_text,
+                # VERY conservative: we do not treat pages as blank lightly
                 "is_blank": is_mostly_blank(img, ocr_text),
             }
         )
@@ -264,86 +298,134 @@ def document_to_page_infos(url: str, content: bytes) -> List[Dict[str, Any]]:
 
 
 # ============================================================
-#  LLM Prompt – OCR-aware, strong & repetition-safe
+#  LLM Prompt – OCR-aware, high-precision + no double-count
 # ============================================================
 
 SYSTEM_PROMPT = """
-You are an ADVANCED MEDICAL BILL EXTRACTION ENGINE designed for high-volume 
-hospital invoices, repeated consultation logs, pharmacy sheets, lab reports, 
-and multi-page detailed bills. Your job is to EXTRACT EVERY SINGLE PHYSICAL 
-LINE-ITEM ROW printed on THIS PAGE IMAGE (or cropped region of this page).
+You are an expert medical BILL ITEM extraction engine designed for an evaluation
+where BOTH of the following matter:
 
-CRITICAL BEHAVIOR:
-============================================================
-(1) DO NOT group or merge multiple rows into one.
-(2) DO NOT deduplicate.
-(3) DO NOT infer items from previous/next pages.
-(4) DO NOT hallucinate rows or columns.
-(5) IF TWO ROWS LOOK IDENTICAL, extract BOTH as separate entries.
-(6) If a row spans two visual lines but is one logical row,
-    MERGE those lines and output a single JSON item.
-(7) If two items are visually separate rows, NEVER merge them.
+1) Every genuine line item on the bill must be captured (high recall).
+2) There must be NO double counting or duplication of the same line item.
 
-ABOUT THESE PAGES:
-============================================================
-• Bills may contain 10–70+ rows on one page.
-• Many rows can be repetitive (e.g., “IP CONSULTATION CHARGES” repeated 40 times).
-• Some pages may contain multiple tables: investigations, pharmacy, consultation.
-• Some pages include blank or zero-valued columns (e.g., "0.00") which must be preserved.
+The evaluator will:
+- Compare the sum of all your extracted `item_amount` values against the
+  FINAL TOTAL shown on the bill.
+- Check that your line items match the descriptions and numeric values printed
+  in the bill tables.
+Your goal is to make the AI-extracted total as close as possible to the actual
+bill final total WITHOUT missing items or double-counting.
 
-WHAT COUNTS AS A LINE ITEM:
-============================================================
-A “line item” is a PHYSICAL TABLE ROW that has:
-• A description (test name, charge name, drug name, ward charge, procedure name, etc.)
-• A quantity (Qty, QTY, Qty/Hrs, No. of units)
-• A rate (Rate, Price, Unit Price)
-• A total / amount (Amount, Total, Net Amt, Line Total)
+---------- DOCUMENT STRUCTURE & TERMINOLOGY ----------
 
-Each PHYSICAL ROW → EXACTLY ONE JSON OBJECT in bill_items.
+You are given a SINGLE PAGE IMAGE of a multi-page bill/invoice.
 
-WHAT TO IGNORE:
-============================================================
-• Page headers, footers, serial numbers, dates, patient info
-• “Name”, “IP No”, “Bill No”, “UHID”, “Admn No”, etc.
-• Section headers (e.g., “CONSULTATION”, “INVESTIGATION CHARGES”, “OTHERS”)
-• Summary rows or financial totals such as:
-  “Total”, “Sub Total”, “Net Amount Payable”, “Grand Total”,
-  “ROUND OFF”, “CGST / SGST / IGST”, “DISCOUNT”, “Tax on Item”, etc.
+Typical structure:
+- Hospital or clinic header (logo, name, address).
+- Patient information (name, age, ID, dates).
+- One or more TABLES containing charges:
+    * Investigations/Pathology/Lab tests
+    * Radiology / Imaging
+    * Procedures / Operation charges
+    * Consultation / Doctor visit charges
+    * Bed / Room / Ward charges
+    * Nursing, Maintenance, Service charges
+    * Pharmacy / Medicines
+- Optional sections with headings like:
+    "PATHOLOGY", "RADIOLOGY", "PHARMACY CHARGES", "BED CHARGES", etc.
+- Sub-total rows for each section.
+- Final summaries: "Total", "Grand Total", "Net Amount Payable",
+  "Amount Received", "Balance", "Discount", "GST", "CGST", "SGST", etc.
 
-NUMERIC EXTRACTION:
-============================================================
-• item_quantity: exact numeric quantity from Qty/QTY/QTY/Hrs column.
-• item_rate: exact per-unit rate.
-• item_amount: the total for that row.
-• If quantity is clearly missing but a single total exists, assume quantity = 1 and rate = total.
-• If rate is missing but quantity and amount are visible, set rate = amount / quantity.
-• If a numeric field is blank or unreadable, use 0.0 instead of null.
-• If amount is very close to rate × quantity, keep the printed amount; do NOT over-correct.
+Definitions (VERY IMPORTANT):
+- A "LINE ITEM" is one logical row describing a single charge, such as:
+    - A CONCRETE test/procedure: "RENAL FUNCTION TEST (RFT)", "ELECTROLYTES"
+    - A bed charge: "Room Ward Charges", "ICU Bed Charges"
+    - A consultation: "IP CONSULTATION CHARGES (Dr. ...)"
+    - A pharmacy item: a medicine or drug name with qty, rate, and amount.
+- Each line item should have:
+    * item_name: textual description for that charge.
+    * item_quantity: how many units / days / hours, etc.
+    * item_rate: per-unit price.
+    * item_amount: net amount for that line item AFTER discounts, BEFORE tax
+      (use the number printed in the row for that item).
 
-PAGE TYPE CLASSIFICATION:
-============================================================
-Choose ONE page_type based ONLY on THIS PAGE (or crop of this page):
-• "Bill Detail"  – investigations, procedures, ward/room charges, consultations, etc.
-• "Pharmacy"     – medicines, drugs, syrups, injections.
-• "Final Bill"   – summary-style bill with a smaller list plus grand totals.
+Section headers and totals:
+- Section titles like "PATHOLOGY", "RADIOLOGY", "PHARMACY CHARGES",
+  "BED CHARGES", "CONSULTATION", etc. are NOT items.
+- Summary/total rows like "Total PATHOLOGY", "LAB TOTAL", "PHARMACY TOTAL",
+  "SUB TOTAL", "TOTAL", "GRAND TOTAL", "NET AMOUNT PAYABLE", "ROUND OFF",
+  "GST", "CGST", "SGST", "IGST", "DISCOUNT", "TAX ON" are NOT items.
 
-MULTI-TABLE PAGES:
-============================================================
-If the page (or crop) contains multiple tables:
-• Extract items from ALL tables you see in this image region.
-• Process each visible row independently.
-• Preserve natural top-to-bottom order as much as possible.
+You MUST NOT output these rows as bill_items.
+Instead, you implicitly use them as a sanity check: the sum of your item_amount
+values for all rows on all pages should match these totals as closely as possible,
+but you do not output the total rows themselves.
 
-ANTI-HALLUCINATION RULES:
-============================================================
-• NEVER add rows that are not visibly present.
-• NEVER invent section names, descriptions, or numeric values.
-• NEVER copy rows from OCR text if they do not match an actual row in the image.
-• When in doubt, SKIP a row instead of hallucinating.
+---------- CRITICAL RULES: NO MISSING, NO DOUBLE COUNTING ----------
 
-OUTPUT FORMAT:
-============================================================
-Return STRICT JSON ONLY (no markdown, no commentary), with this exact shape:
+1. PROCESS ONLY THIS PAGE IMAGE.
+   - Do NOT invent items from other pages.
+   - Every JSON object must correspond to a visible row on THIS page.
+
+2. DO NOT MISS items:
+   - For every visible row that clearly has a description + numeric amount,
+     you must extract one bill_items entry.
+   - If a row has no visible amount or is clearly not a charge (e.g., header),
+     skip it.
+
+3. DO NOT DOUBLE COUNT:
+   - If the same line item is repeated multiple times with the same description,
+     same quantity, same rate, and same amount (i.e., visually the same row only once),
+     output it ONLY ONCE.
+   - If the bill clearly lists the same item multiple times on separate rows
+     (e.g., same test done on different days), then you may output multiple entries
+     BUT only if they are really separate rows in the table.
+   - Never output multiple identical JSON objects that correspond to a SINGLE visual row.
+
+4. HANDLING QUANTITY / RATE / AMOUNT:
+   - item_quantity = numeric value under "Qty", "QTY", "QTY/Hrs", "No. of days", etc.
+   - item_rate     = numeric value under "Rate", "RATE", "Per day", "Charge", etc.
+   - item_amount   = numeric value under "Amount", "Amt (Rs.)", "Net Amt", "Total", etc.
+   - If quantity is clearly missing but there is a total amount for the row:
+       -> assume quantity = 1.0 and rate = amount.
+   - If rate is missing but quantity and amount are visible:
+       -> rate = amount / quantity (rounded sensibly).
+   - If a numeric field is BLANK / unreadable:
+       -> set it to 0.0 (do NOT use null or empty string).
+
+5. HANDLING SUB-TOTALS AND FINAL TOTAL:
+   - Sub-total rows (per section) and the final total row are NOT individual items.
+   - You may mentally cross-check that "sum of item_amount" for that section/page
+     roughly matches the sub-total shown, but you MUST NOT add them as bill_items.
+   - The final evaluation will compute:
+       AI_Total = sum of all item_amount across all bill_items in the entire document
+     and compare it to the printed final total on the bill.
+   - Your responsibility is to:
+       - include every genuine item row
+       - NOT double-count the same row
+       - ensure the numbers on each row are consistent with the bill.
+
+6. page_type classification:
+   - "Bill Detail"  → typical detailed list of line items (most pages).
+   - "Pharmacy"    → mainly medicines / drugs with Qty, Rate, Amount.
+   - "Final Bill"  → summary-style page that may repeat line items or show
+                     only a compressed version plus final totals.
+   Choose the best label FOR THIS PAGE ONLY.
+
+7. MULTIPLE TABLES ON THE SAME PAGE:
+   - If the page has multiple tables of charges (e.g., investigations + bed
+     charges + consultation), extract items from ALL of them.
+   - Still obey the rule: never treat section headers or totals as items.
+
+8. NUMERIC TYPES:
+   - All numeric fields must be valid JSON numbers (no null, no empty strings).
+   - Use "." as decimal separator.
+   - Do NOT put commas inside numbers (e.g., use 1200.5 not "1,200.5").
+
+---------- OUTPUT FORMAT (STRICT JSON) ----------
+
+You MUST output STRICT JSON (no markdown, no backticks) with this exact shape:
 
 {
   "page_no": "<page number as string>",
@@ -358,44 +440,51 @@ Return STRICT JSON ONLY (no markdown, no commentary), with this exact shape:
   ]
 }
 
-Do NOT wrap JSON in ``` marks.
-Do NOT add extra keys.
+Restrictions:
+- Do NOT wrap the JSON in ``` marks.
+- Do NOT add extra keys at any level.
+- Do NOT output totals, sub-totals, or tax rows as bill_items.
+- Do NOT output the same (name, quantity, rate, amount) row multiple times
+  unless they clearly correspond to separate visible rows in the table.
 """
 
 
-def call_groq_for_region(
+def call_groq_for_page(
     page_no: int,
     image_data_url: str,
     ocr_text: str,
 ) -> Tuple[Dict[str, Any], TokenUsage]:
     """
-    Call Groq Vision model for a single page REGION (crop) image,
-    with OCR text from the full page as a hint.
+    Call Groq Vision model for a single page image, with OCR text as hint.
     """
-    # Truncate OCR text to keep prompt size reasonable
+
+    # Truncate OCR text to keep prompt size reasonable & fast
     ocr_text_snippet = (ocr_text or "").strip()
-    if len(ocr_text_snippet) > 2000:
-        ocr_text_snippet = ocr_text_snippet[:2000]
+    if len(ocr_text_snippet) > 1200:  # shorter than before → faster, cheaper
+        ocr_text_snippet = ocr_text_snippet[:1200]
 
     user_text = f"""
-You are processing PAGE {page_no} of a multi-page bill.
-
-This image is a REGION (crop) from that page. Extract ONLY the line items 
-that are VISIBLY PRESENT inside this region.
+You are processing page number {page_no} of a multi-page medical bill.
 
 Use page_no="{page_no}" in the JSON.
+Classify page_type as exactly one of:
+- "Bill Detail"
+- "Final Bill"
+- "Pharmacy"
 
-Below is OCR text extracted from the FULL PAGE. Use it only as a noisy hint
-to help read small fonts and numbers. DO NOT invent items that are not visible
-in this region.
+Below is OCR text extracted from THIS PAGE ONLY (may contain noise).
+Use it to help read small fonts and numbers, but always confirm by looking
+at the table structure in the image.
 
 OCR_TEXT_START
 {ocr_text_snippet}
 OCR_TEXT_END
 
 Remember:
-- Each PHYSICAL ROW in this region → exactly one JSON object.
-- Repeated rows must be output MULTIPLE times.
+- Extract ONLY item-level rows that are PHYSICALLY PRESENT in THIS PAGE IMAGE.
+- Do NOT bring items from other pages.
+- Do NOT miss any genuine line items.
+- Do NOT double-count the same line item.
 """
 
     try:
@@ -497,23 +586,44 @@ def _coerce_number(x: Any) -> float:
     return 0.0
 
 
-def clean_page_dict(page_dict: Dict[str, Any]) -> Dict[str, Any]:
+def clean_page_dict(page_dict: Dict[str, Any]) -> Dict[str, Any]]:
     """
     Pre-clean the raw JSON dict from the model so that Pydantic parsing will not
     fail when numeric fields are null/empty/etc.
+    Also performs within-page exact duplicate removal at dictionary level.
     """
     bill_items = page_dict.get("bill_items", []) or []
     cleaned_items: List[Dict[str, Any]] = []
 
+    seen_keys: Set[Tuple[str, float, float, float]] = set()
+
     for item in bill_items:
         if not isinstance(item, dict):
             continue
+
+        name = str(item.get("item_name", "")).strip()
+        amount = _coerce_number(item.get("item_amount"))
+        rate = _coerce_number(item.get("item_rate"))
+        qty = _coerce_number(item.get("item_quantity"))
+
+        # Exact quadruple key for dedupe (within this page)
+        key = (
+            name.lower(),
+            round(amount, 2),
+            round(rate, 4),
+            round(qty, 4),
+        )
+        if key in seen_keys:
+            # LLM hallucinated a duplicate of the same row → drop it
+            continue
+        seen_keys.add(key)
+
         cleaned_items.append(
             {
-                "item_name": str(item.get("item_name", "")).strip(),
-                "item_amount": _coerce_number(item.get("item_amount")),
-                "item_rate": _coerce_number(item.get("item_rate")),
-                "item_quantity": _coerce_number(item.get("item_quantity")),
+                "item_name": name,
+                "item_amount": amount,
+                "item_rate": rate,
+                "item_quantity": qty,
             }
         )
 
@@ -547,8 +657,8 @@ def reconcile_page_items(page_dict: Dict[str, Any]) -> PageItems:
 
         if rate and qty:
             computed = rate * qty
-            # Only adjust when mismatch is very large and amount looks wrong
-            if math.isfinite(computed) and abs(computed - amount) > 5 * EPS:
+            if math.isfinite(computed) and abs(computed - amount) > EPS:
+                # Trust arithmetic over noisy OCR when there is a big mismatch
                 item.item_amount = round(computed, 2)
         elif amount and qty and qty != 0:
             computed_rate = amount / qty
@@ -560,13 +670,46 @@ def reconcile_page_items(page_dict: Dict[str, Any]) -> PageItems:
     return page_items
 
 
+def dedupe_all_pages(pages: List[PageItems]) -> List[PageItems]:
+    """
+    De-duplicate clearly repeated items across pages.
+
+    We treat items with identical:
+        (page_type, normalized_name, rate, qty, amount)
+    as duplicates and keep only the first occurrence.
+
+    This mainly protects against accidental double extraction of the
+    SAME scan / SAME bill, not against legitimate multiple charges.
+    """
+    seen: Set[Tuple[str, str, float, float, float]] = set()
+    deduped_pages: List[PageItems] = []
+
+    for p in pages:
+        new_items: List[BillItem] = []
+        for item in p.bill_items:
+            key = (
+                p.page_type.strip().lower(),
+                item.item_name.strip().lower(),
+                round(float(item.item_rate), 4),
+                round(float(item.item_quantity), 4),
+                round(float(item.item_amount), 2),
+            )
+            if key in seen:
+                # duplicate – likely hallucination or repeated extraction
+                continue
+            seen.add(key)
+            new_items.append(item)
+
+        p.bill_items = new_items
+        deduped_pages.append(p)
+
+    return deduped_pages
+
+
 def aggregate_all_pages(pages: List[PageItems]) -> ExtractBillDataResponseData:
     """
-    Compute total_item_count. Grand total is intentionally NOT included,
-    to match the exact Datathon schema.
-
-    NOTE: We DO NOT deduplicate here, to preserve repeated rows like
-    multiple IP CONSULTATION CHARGES entries.
+    Compute total_item_count. Grand total is intentionally NOT included in
+    the schema (organizers will compute it from bill_items).
     """
     total_items = sum(len(p.bill_items) for p in pages)
     return ExtractBillDataResponseData(
@@ -576,13 +719,13 @@ def aggregate_all_pages(pages: List[PageItems]) -> ExtractBillDataResponseData:
 
 
 # ============================================================
-#  API Endpoint – High Recall Multi-Crop
+#  API Endpoint
 # ============================================================
 
 @app.post("/extract-bill-data", response_model=ExtractBillDataResponse)
 def extract_bill_data(req: ExtractBillDataRequest):
     """
-    Main Datathon endpoint – High Recall Mode.
+    Main Datathon endpoint.
 
     Request:
         {
@@ -621,73 +764,32 @@ def extract_bill_data(req: ExtractBillDataRequest):
     input_tokens = 0
     output_tokens = 0
 
-    # 3. Run Groq Vision model on each NON-BLANK page with multi-crop
+    # 3. Run Groq Vision model on each NON-blank page
     logical_page_no = 1
     for info in page_infos:
+        # VERY conservative: almost everything is treated as non-blank
         if info.get("is_blank"):
-            # For safety we keep the branch; currently is_blank is always False.
+            # Skip only pages that are clearly blank
+            logical_page_no += 1
             continue
 
-        pil_page: Image.Image = info["pil_image"]
-        full_ocr_text = info.get("ocr_text", "")
+        data_url = info["data_url"]
+        ocr_text = info.get("ocr_text", "")
 
-        # ----- Generate crops -----
-        width, height = pil_page.size
-        crop_h = height // NUM_CROPS_PER_PAGE or height
-        crops: List[Image.Image] = []
-        for i in range(NUM_CROPS_PER_PAGE):
-            top = i * crop_h
-            bottom = height if i == NUM_CROPS_PER_PAGE - 1 else (i + 1) * crop_h
-            crops.append(pil_page.crop((0, top, width, bottom)))
+        parsed_json, usage = call_groq_for_page(
+            page_no=logical_page_no,
+            image_data_url=data_url,
+            ocr_text=ocr_text,
+        )
 
-        # ----- Call model for each crop -----
-        crop_results: List[Dict[str, Any]] = []
-        crop_page_types: List[str] = []
-
-        for crop in crops:
-            crop_data_url = image_to_data_url(crop)
-            parsed_json, usage = call_groq_for_region(
-                page_no=logical_page_no,
-                image_data_url=crop_data_url,
-                ocr_text=full_ocr_text,
-            )
-
-            # accumulate usage
-            total_tokens += usage.total_tokens
-            input_tokens += usage.input_tokens
-            output_tokens += usage.output_tokens
-
-            # store results
-            crop_results.append(parsed_json)
-            pt = str(parsed_json.get("page_type", "") or "").strip()
-            if pt:
-                crop_page_types.append(pt)
-
-        # ----- Merge crops into one logical page -----
-        merged_items_raw: List[Dict[str, Any]] = []
-        for cr in crop_results:
-            items = cr.get("bill_items", []) or []
-            if isinstance(items, list):
-                merged_items_raw.extend(items)
-
-        # pick majority page_type if possible
-        if crop_page_types:
-            from collections import Counter
-            pt_counts = Counter(crop_page_types)
-            page_type = pt_counts.most_common(1)[0][0]
-        else:
-            page_type = "Bill Detail"
-
-        raw_page_dict: Dict[str, Any] = {
-            "page_no": str(logical_page_no),
-            "page_type": page_type,
-            "bill_items": merged_items_raw,
-        }
-
-        page_items = reconcile_page_items(raw_page_dict)
-        # Ensure page_no exactly matches our logical counter
+        page_items = reconcile_page_items(parsed_json)
+        # Ensure page_no is consistent with our logical numbering
         page_items.page_no = str(logical_page_no)
         all_pages.append(page_items)
+
+        total_tokens += usage.total_tokens
+        input_tokens += usage.input_tokens
+        output_tokens += usage.output_tokens
 
         logical_page_no += 1
 
@@ -697,7 +799,10 @@ def extract_bill_data(req: ExtractBillDataRequest):
             message="All pages were detected as blank; nothing to extract.",
         )
 
-    # 4. Aggregate without deduplication (preserve repeated rows)
+    # 4. De-duplicate obviously repeated items across pages
+    all_pages = dedupe_all_pages(all_pages)
+
+    # 5. Aggregate
     data = aggregate_all_pages(all_pages)
 
     token_usage = TokenUsage(
