@@ -7,6 +7,7 @@ import mimetypes
 import os
 import time
 from typing import List, Optional, Tuple, Any, Dict, Set
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 from fastapi import FastAPI, HTTPException
@@ -32,6 +33,10 @@ GROQ_VISION_MODEL_ID = os.environ.get(
 
 # Groq Vision limit: MAX 5 images per request
 MAX_IMAGES_PER_REQUEST = 5
+
+# How many Groq batches to run in parallel
+# 2–3 is usually safe; 3 uses more bandwidth but is faster.
+MAX_PARALLEL_BATCHES = 3
 
 
 # ============================================================
@@ -79,10 +84,11 @@ class ExtractBillDataResponse(BaseModel):
 
 app = FastAPI(
     title="Bajaj Datathon Bill Extraction API",
-    version="5.0.0",
+    version="6.0.0",
     description=(
         "Extracts line items from multi-page bill/invoice documents using "
-        "Groq vision models with batching (max 5 images per request). "
+        "Groq vision models with batched + parallel processing "
+        "(max 5 images per request, multi-batch concurrency). "
         "Implements the exact HackRx Datathon schema and is tuned for "
         "high accuracy while staying under time limits on large PDFs."
     ),
@@ -96,10 +102,6 @@ app = FastAPI(
 def download_document(url: str) -> bytes:
     """
     Download the document from the given URL.
-    Supports:
-    - Direct image URLs (png, jpg, jpeg, webp, etc.)
-    - Direct PDF URLs
-    - Public file links that resolve to the above
     """
     try:
         resp = requests.get(url, timeout=40)
@@ -126,10 +128,10 @@ def guess_mime_type(url: str, content: bytes) -> str:
     return "application/octet-stream"
 
 
-def _resize_for_vision(img: Image.Image, max_dim: int = 1100) -> Image.Image:
+def _resize_for_vision(img: Image.Image, max_dim: int = 900) -> Image.Image:
     """
     Downscale to reduce tokens & latency while keeping table details readable.
-    Smaller max_dim → faster + cheaper, still fine for Scout.
+    Slightly smaller than before for faster model calls.
     """
     w, h = img.size
     scale = max(w, h) / float(max_dim)
@@ -140,24 +142,24 @@ def _resize_for_vision(img: Image.Image, max_dim: int = 1100) -> Image.Image:
     return img.resize((new_w, new_h), Image.LANCZOS)
 
 
-def image_to_data_url(img: Image.Image, quality: int = 60) -> str:
+def image_to_data_url(img: Image.Image, quality: int = 50) -> str:
     """
     Convert a PIL Image into a base64 JPEG data URL.
 
-    - Resize to max_dim=1100
-    - JPEG quality ~60 (enough for text to be readable for the model)
+    - Resize to max_dim=900
+    - JPEG quality ~50 (enough for text to be readable for the model)
     - Ensure < 4 MB per image as per Groq base64 limits.
     """
-    img = _resize_for_vision(img, max_dim=1100)
+    img = _resize_for_vision(img, max_dim=900)
 
     buf = io.BytesIO()
-    img.save(buf, format="JPEG", quality=quality)
+    img.save(buf, format="JPEG", quality=quality, optimize=True)
     b = buf.getvalue()
 
     while len(b) > 4 * 1024 * 1024 and quality > 30:
-        quality -= 10
+        quality -= 5
         buf = io.BytesIO()
-        img.save(buf, format="JPEG", quality=quality)
+        img.save(buf, format="JPEG", quality=quality, optimize=True)
         b = buf.getvalue()
 
     b64 = base64.b64encode(b).decode("utf-8")
@@ -175,7 +177,10 @@ def document_to_page_infos(url: str, content: bytes) -> List[Dict[str, Any]]:
 
     - If image: one page.
     - If PDF: one image per page.
-    OCR is NOT used for speed.
+
+    OPTIMIZED:
+    - PDF rendered at lower DPI (150) directly to JPEG.
+    - Multi-threaded conversion (thread_count=4) to use multiple vCPUs.
     """
     mime = guess_mime_type(url, content)
     page_infos: List[Dict[str, Any]] = []
@@ -201,7 +206,13 @@ def document_to_page_infos(url: str, content: bytes) -> List[Dict[str, Any]]:
     # PDFs
     if mime == "application/pdf":
         try:
-            pages = convert_from_bytes(content)
+            # Lower dpi + jpeg + multi-threaded = MUCH faster than defaults
+            pages = convert_from_bytes(
+                content,
+                dpi=150,
+                fmt="jpeg",
+                thread_count=4,
+            )
         except Exception as e:
             raise HTTPException(
                 status_code=400,
@@ -403,12 +414,8 @@ Then return ONE combined JSON object for this batch, matching exactly the
 structure described in the system instructions.
 """
 
-    # Build content list: one user message with text + all images in this batch
     user_content: List[Dict[str, Any]] = [
-        {
-            "type": "input_text",
-            "text": user_text.strip(),
-        }
+        {"type": "input_text", "text": user_text.strip()}
     ]
 
     for idx, info in enumerate(batch_page_infos):
@@ -468,7 +475,7 @@ structure described in the system instructions.
 
     raw_text = response.output_text.strip()
 
-    # Robust JSON parsing (strip ```json fences etc. if present)
+    # Robust JSON parsing
     try:
         parsed = json.loads(raw_text)
     except json.JSONDecodeError:
@@ -489,7 +496,6 @@ structure described in the system instructions.
                 detail=f"Model response is not valid JSON: {raw_text[:200]}",
             )
 
-    # Normalise: extract list of pages from batch JSON
     if isinstance(parsed, dict) and "pagewise_line_items" in parsed:
         raw_pages = parsed.get("pagewise_line_items", []) or []
     elif isinstance(parsed, list):
@@ -511,9 +517,7 @@ structure described in the system instructions.
                 }
             )
 
-    # If model returned extra pages, ignore extras
     raw_pages = raw_pages[:num_batch_pages]
-
     return raw_pages, token_usage
 
 
@@ -568,7 +572,6 @@ def clean_page_dict(page_dict: Dict[str, Any]) -> Dict[str, Any]:
             round(qty, 4),
         )
         if key in seen_keys:
-            # Drop exact duplicates on the same page
             continue
         seen_keys.add(key)
 
@@ -612,7 +615,6 @@ def reconcile_page_items(page_dict: Dict[str, Any]) -> PageItems:
         if rate and qty:
             computed = rate * qty
             if math.isfinite(computed) and abs(computed - amount) > EPS:
-                # Trust arithmetic over noisy OCR when mismatch is large
                 item.item_amount = round(computed, 2)
         elif amount and qty and qty != 0:
             computed_rate = amount / qty
@@ -627,13 +629,6 @@ def reconcile_page_items(page_dict: Dict[str, Any]) -> PageItems:
 def dedupe_all_pages(pages: List[PageItems]) -> List[PageItems]:
     """
     De-duplicate clearly repeated items across pages.
-
-    Items with identical:
-        (page_type, normalized_name, rate, qty, amount)
-    are treated as duplicates; we keep only the first occurrence.
-
-    This protects against double-counting when summary pages re-list items
-    already fully detailed elsewhere.
     """
     seen: Set[Tuple[str, str, float, float, float]] = set()
     deduped_pages: List[PageItems] = []
@@ -649,7 +644,6 @@ def dedupe_all_pages(pages: List[PageItems]) -> List[PageItems]:
                 round(float(item.item_amount), 2),
             )
             if key in seen:
-                # duplicate – likely repeated summary row
                 continue
             seen.add(key)
             new_items.append(item)
@@ -661,10 +655,6 @@ def dedupe_all_pages(pages: List[PageItems]) -> List[PageItems]:
 
 
 def aggregate_all_pages(pages: List[PageItems]) -> ExtractBillDataResponseData:
-    """
-    Compute total_item_count. Grand total is intentionally NOT included in
-    the schema (organizers will compute it from bill_items).
-    """
     total_items = sum(len(p.bill_items) for p in pages)
     return ExtractBillDataResponseData(
         pagewise_line_items=pages,
@@ -673,9 +663,6 @@ def aggregate_all_pages(pages: List[PageItems]) -> ExtractBillDataResponseData:
 
 
 def compute_grand_total_amount(pages: List[PageItems]) -> float:
-    """
-    Utility: sum of all item_amounts – for logging only.
-    """
     total = 0.0
     for p in pages:
         for item in p.bill_items:
@@ -689,10 +676,6 @@ def compute_grand_total_amount(pages: List[PageItems]) -> float:
 
 @app.get("/extract-bill-data")
 def health_check():
-    """
-    Simple GET endpoint so health checks don't see 405.
-    The evaluators will use POST for actual scoring.
-    """
     return {
         "message": "Health OK. Use POST /extract-bill-data with JSON body "
                    '{"document": "<public image/PDF URL>"} to extract bill data.'
@@ -705,28 +688,6 @@ def health_check():
 
 @app.post("/extract-bill-data", response_model=ExtractBillDataResponse)
 def extract_bill_data(req: ExtractBillDataRequest):
-    """
-    Main Datathon endpoint.
-
-    Request:
-        {
-          "document": "<public URL to image or PDF>"
-        }
-
-    Response (SUCCESS, 200):
-        {
-          "is_success": true,
-          "token_usage": {
-            "total_tokens": int,
-            "input_tokens": int,
-            "output_tokens": int
-          },
-          "data": {
-            "pagewise_line_items": [...],
-            "total_item_count": int
-          }
-        }
-    """
     start_time = time.time()
     url_str = str(req.document)
 
@@ -748,30 +709,49 @@ def extract_bill_data(req: ExtractBillDataRequest):
             message="No pages/images could be extracted from the document.",
         )
 
-    # 3. Process pages in batches of <= MAX_IMAGES_PER_REQUEST
-    all_pages: List[PageItems] = []
+    # 3. Build batches of ≤ MAX_IMAGES_PER_REQUEST
+    batches: List[Tuple[int, List[Dict[str, Any]]]] = []
+    for batch_start in range(0, num_pages, MAX_IMAGES_PER_REQUEST):
+        batch_end = min(batch_start + MAX_IMAGES_PER_REQUEST, num_pages)
+        batches.append((batch_start, page_infos[batch_start:batch_end]))
+
+    # 4. Call Groq in PARALLEL for each batch
+    all_pages_by_no: Dict[int, PageItems] = {}
     total_tokens = 0
     input_tokens = 0
     output_tokens = 0
 
-    for batch_start in range(0, num_pages, MAX_IMAGES_PER_REQUEST):
-        batch_end = min(batch_start + MAX_IMAGES_PER_REQUEST, num_pages)
-        batch_page_infos = page_infos[batch_start:batch_end]
+    max_workers = min(MAX_PARALLEL_BATCHES, len(batches))
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_batch_start = {
+            executor.submit(call_groq_for_batch, batch_page_infos): batch_start
+            for batch_start, batch_page_infos in batches
+        }
 
-        raw_pages_batch, usage_batch = call_groq_for_batch(batch_page_infos)
+        for future in as_completed(future_to_batch_start):
+            batch_start = future_to_batch_start[future]
+            try:
+                raw_pages_batch, usage_batch = future.result()
+            except HTTPException as e:
+                # Surface LLM-related / HTTP errors cleanly
+                raise e
+            except Exception as e:
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Internal error during LLM batch: {e}",
+                )
 
-        total_tokens += usage_batch.total_tokens
-        input_tokens += usage_batch.input_tokens
-        output_tokens += usage_batch.output_tokens
+            total_tokens += usage_batch.total_tokens
+            input_tokens += usage_batch.input_tokens
+            output_tokens += usage_batch.output_tokens
 
-        # Map batch-local page_no → global page_no
-        for i, page_dict in enumerate(raw_pages_batch):
-            global_page_no = batch_start + i + 1  # 1-based for entire document
-            page_dict["page_no"] = str(global_page_no)
-            page_items = reconcile_page_items(page_dict)
-            all_pages.append(page_items)
+            for i, page_dict in enumerate(raw_pages_batch):
+                global_page_no = batch_start + i + 1  # 1-based
+                page_dict["page_no"] = str(global_page_no)
+                page_items = reconcile_page_items(page_dict)
+                all_pages_by_no[global_page_no] = page_items
 
-    if not all_pages:
+    if not all_pages_by_no:
         elapsed = time.time() - start_time
         print(
             f"[BILL_EXTRACT] pages={num_pages} items=0 total_amount=0.00 "
@@ -787,10 +767,24 @@ def extract_bill_data(req: ExtractBillDataRequest):
             message="Model did not return any page items.",
         )
 
-    # 4. De-duplicate obviously repeated items across pages
+    # Ensure pages are in correct global order and fill any missing with empty
+    all_pages: List[PageItems] = []
+    for page_no in range(1, num_pages + 1):
+        if page_no in all_pages_by_no:
+            all_pages.append(all_pages_by_no[page_no])
+        else:
+            all_pages.append(
+                PageItems(
+                    page_no=str(page_no),
+                    page_type="Bill Detail",
+                    bill_items=[],
+                )
+            )
+
+    # 5. De-duplicate obviously repeated items across pages
     all_pages = dedupe_all_pages(all_pages)
 
-    # 5. Aggregate
+    # 6. Aggregate
     data = aggregate_all_pages(all_pages)
 
     token_usage = TokenUsage(
@@ -799,11 +793,9 @@ def extract_bill_data(req: ExtractBillDataRequest):
         output_tokens=output_tokens,
     )
 
-    # 6. Compute a simple "grand total amount" for logging
+    # 7. Logging
     grand_total = compute_grand_total_amount(all_pages)
     elapsed = time.time() - start_time
-
-    # Railway log line – helps you debug performance & quality
     print(
         f"[BILL_EXTRACT] pages={num_pages} "
         f"items={data.total_item_count} "
