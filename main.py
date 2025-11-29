@@ -6,14 +6,14 @@ import math
 import mimetypes
 import os
 import time
-from typing import List, Optional, Tuple, Any, Dict, Set
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections import defaultdict
+from typing import List, Optional, Tuple, Any, Dict
 
 import requests
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, HttpUrl
 from pdf2image import convert_from_bytes
-from PIL import Image
+from PIL import Image, ImageEnhance
 from openai import OpenAI
 
 # ============================================================
@@ -25,7 +25,7 @@ client = OpenAI(
     base_url="https://api.groq.com/openai/v1",
 )
 
-# Balanced mode: fast + good accuracy
+# Fast + good accuracy
 GROQ_VISION_MODEL_ID = os.environ.get(
     "GROQ_VISION_MODEL_ID",
     "meta-llama/llama-4-scout-17b-16e-instruct",
@@ -34,13 +34,9 @@ GROQ_VISION_MODEL_ID = os.environ.get(
 # Groq Vision limit: MAX 5 images per request
 MAX_IMAGES_PER_REQUEST = 5
 
-# How many Groq batches to run in parallel
-# 2–3 is usually safe; 3 uses more bandwidth but is faster.
-MAX_PARALLEL_BATCHES = 3
-
 
 # ============================================================
-#  Pydantic Schemas – EXACTLY as per Datathon spec
+#  Pydantic Schemas – EXACT Datathon spec
 # ============================================================
 
 class BillItem(BaseModel):
@@ -87,8 +83,7 @@ app = FastAPI(
     version="6.0.0",
     description=(
         "Extracts line items from multi-page bill/invoice documents using "
-        "Groq vision models with batched + parallel processing "
-        "(max 5 images per request, multi-batch concurrency). "
+        "Groq vision models with batching (max 5 images per request). "
         "Implements the exact HackRx Datathon schema and is tuned for "
         "high accuracy while staying under time limits on large PDFs."
     ),
@@ -100,9 +95,7 @@ app = FastAPI(
 # ============================================================
 
 def download_document(url: str) -> bytes:
-    """
-    Download the document from the given URL.
-    """
+    """Download the document from the given URL."""
     try:
         resp = requests.get(url, timeout=40)
         resp.raise_for_status()
@@ -115,23 +108,19 @@ def download_document(url: str) -> bytes:
 
 
 def guess_mime_type(url: str, content: bytes) -> str:
-    """
-    Guess mime type based on URL extension or magic bytes.
-    """
+    """Guess mime type based on URL extension or magic bytes."""
     mime, _ = mimetypes.guess_type(url)
     if mime:
         return mime
-
     if content[:4] == b"%PDF":
         return "application/pdf"
-
     return "application/octet-stream"
 
 
-def _resize_for_vision(img: Image.Image, max_dim: int = 900) -> Image.Image:
+def _resize_for_vision(img: Image.Image, max_dim: int = 950) -> Image.Image:
     """
     Downscale to reduce tokens & latency while keeping table details readable.
-    Slightly smaller than before for faster model calls.
+    Slightly smaller than before for better speed on 30+ pages.
     """
     w, h = img.size
     scale = max(w, h) / float(max_dim)
@@ -142,24 +131,36 @@ def _resize_for_vision(img: Image.Image, max_dim: int = 900) -> Image.Image:
     return img.resize((new_w, new_h), Image.LANCZOS)
 
 
-def image_to_data_url(img: Image.Image, quality: int = 50) -> str:
+def _enhance_for_vision(img: Image.Image) -> Image.Image:
+    """
+    Light contrast + sharpness boost to help faint numeric columns
+    (like those IP CONSULTATION CHARGES pages).
+    """
+    img = ImageEnhance.Contrast(img).enhance(1.6)
+    img = ImageEnhance.Sharpness(img).enhance(1.4)
+    return img
+
+
+def image_to_data_url(img: Image.Image, quality: int = 60) -> str:
     """
     Convert a PIL Image into a base64 JPEG data URL.
 
-    - Resize to max_dim=900
-    - JPEG quality ~50 (enough for text to be readable for the model)
-    - Ensure < 4 MB per image as per Groq base64 limits.
+    - Resize to max_dim=950
+    - Slight enhancement
+    - JPEG quality ~60
+    - Ensure < 4 MB per image
     """
-    img = _resize_for_vision(img, max_dim=900)
+    img = _resize_for_vision(img, max_dim=950)
+    img = _enhance_for_vision(img)
 
     buf = io.BytesIO()
-    img.save(buf, format="JPEG", quality=quality, optimize=True)
+    img.save(buf, format="JPEG", quality=quality)
     b = buf.getvalue()
 
     while len(b) > 4 * 1024 * 1024 and quality > 30:
-        quality -= 5
+        quality -= 10
         buf = io.BytesIO()
-        img.save(buf, format="JPEG", quality=quality, optimize=True)
+        img.save(buf, format="JPEG", quality=quality)
         b = buf.getvalue()
 
     b64 = base64.b64encode(b).decode("utf-8")
@@ -174,13 +175,6 @@ def document_to_page_infos(url: str, content: bytes) -> List[Dict[str, Any]]:
           "page_index": int,   # 0-based
           "data_url": "data:image/jpeg;base64,..."
         }
-
-    - If image: one page.
-    - If PDF: one image per page.
-
-    OPTIMIZED:
-    - PDF rendered at lower DPI (150) directly to JPEG.
-    - Multi-threaded conversion (thread_count=4) to use multiple vCPUs.
     """
     mime = guess_mime_type(url, content)
     page_infos: List[Dict[str, Any]] = []
@@ -206,13 +200,7 @@ def document_to_page_infos(url: str, content: bytes) -> List[Dict[str, Any]]:
     # PDFs
     if mime == "application/pdf":
         try:
-            # Lower dpi + jpeg + multi-threaded = MUCH faster than defaults
-            pages = convert_from_bytes(
-                content,
-                dpi=150,
-                fmt="jpeg",
-                thread_count=4,
-            )
+            pages = convert_from_bytes(content)
         except Exception as e:
             raise HTTPException(
                 status_code=400,
@@ -252,7 +240,7 @@ def document_to_page_infos(url: str, content: bytes) -> List[Dict[str, Any]]:
 
 
 # ============================================================
-#  LLM Prompt – Multi-page (batched), strict JSON, no double-count
+#  LLM Prompt – batched, strict JSON, handle repeated rows
 # ============================================================
 
 SYSTEM_PROMPT = """
@@ -261,92 +249,52 @@ You are an expert medical BILL ITEM extraction engine for hospital bills.
 Your goals:
 
 1) Capture EVERY genuine line item from the tables (high recall).
-2) Do NOT double-count or duplicate the same line item (no over-count).
+2) Do NOT double-count or duplicate the same line item when it is only a summary.
 3) Make the sum of all `item_amount` values across all pages as close as possible
    to the FINAL TOTAL printed in the bill.
 4) Respect the exact JSON structure required by the HackRx Datathon.
 
----------------- DOCUMENT & TERMINOLOGY ----------------
+CRITICAL BEHAVIOUR FOR REPEATED ROWS:
 
-You will receive a *subset* of pages from a hospital bill:
-    Page 1, Page 2, ..., Page K (within this batch).
+- If the same row appears MANY TIMES (e.g. many rows with
+  "IP CONSULTATION CHARGES  Qty 1  Rate 1000  Amount 1000")
+  then you MUST output ONE BILL ITEM PER VISUAL ROW.
+  Example: if 20 such rows are visible, you must output 20 bill_items
+  with the same name & numbers (do NOT collapse them into one).
 
-Each page may contain:
-- Headers (hospital name, patient details, dates).
-- One or more TABLES of charges:
-    * Lab tests / Investigations
-    * Radiology / Imaging
-    * Pharmacy / Medicines
-    * Bed / Room / ICU charges
-    * Operation theatre / Procedure charges
-    * Consultation / Doctor visit charges
-    * Nursing / Maintenance / Service charges
-- Sub-total rows per section.
-- Final summary rows such as:
-    "Total", "Sub Total", "Grand Total", "Net Amount Payable",
-    "Amount Received", "Balance", "Discount", "GST", "CGST", "SGST", etc.
+- Section totals such as "TOTAL", "SUB TOTAL", "GRAND TOTAL",
+  "NET AMOUNT PAYABLE", etc. MUST NOT be emitted as bill_items.
 
-Definitions:
-- A "LINE ITEM" is a single concrete charge row with a meaningful description
-  and a numeric amount.
+NUMERIC RULES:
 
-For each LINE ITEM, you must output:
-    * item_name:    description of the charge
-    * item_quantity: quantity / days / units
-    * item_rate:    rate per unit
-    * item_amount:  net amount for that item AFTER discounts, BEFORE tax
-      (exact number printed in that row for that item when possible)
+- item_quantity: read from columns like "Qty", "No. of Days", etc.
+- item_rate:     from "Rate", "Charges per day", etc.
+- item_amount:   from "Amount", "Net Amt", etc.
 
-Section titles and totals:
-- Titles like "PATHOLOGY", "RADIOLOGY", "PHARMACY CHARGES", "BED CHARGES",
-  "CONSULTATION", etc. are NOT line items.
-- Rows like "Total PATHOLOGY", "LAB TOTAL", "PHARMACY TOTAL",
-  "SUB TOTAL", "TOTAL", "GRAND TOTAL", "NET AMOUNT PAYABLE",
-  "ROUND OFF", "DISCOUNT", "GST", "CGST", "SGST", "IGST" are NOT items.
-You MUST NOT output these rows as bill_items.
+If some numeric fields are missing for a row BUT other rows with the
+same description show clear numbers, use that pattern:
 
----------------- CRITICAL RULES ----------------
+  • If at least one row for the same item_name has
+        quantity = q0 and amount = a0 (or rate = r0),
+    then for rows where the numeric values are unreadable you may assume:
+        quantity = q0
+        rate     = a0 / q0 (or r0)
+        amount   = quantity * rate
 
-1. PROCESS ONLY THE PAGES IN THIS BATCH
-   - You see K page images in order for this batch.
-   - For each page i in this batch, you must output data for THAT page only.
+This means you may RECONSTRUCT missing amounts using the pattern of
+other rows with the same description (e.g. repeated consultation charges).
 
-2. DO NOT MISS ITEMS
-   - For every visible row with description + amount in a table, output one bill_items entry.
-   - Skip pure headers/titles and pure total/summary rows.
+If a numeric field is still unknown after this reasoning, set it to 0.0.
 
-3. DO NOT DOUBLE-COUNT
-   - If an item is shown as a detailed line item and then repeated as a section total
-     or final total, ONLY output the detailed line, not the total.
-   - Do NOT create two JSON entries for a single visual table row.
+OUTPUT FORMAT (PER BATCH):
 
-4. NUMERIC FIELDS
-   - item_quantity: from "Qty", "QTY", "No. of Days", etc.
-   - item_rate:     from "Rate", "RATE", "Charges per day", etc.
-   - item_amount:   from "Amount", "Net Amt", "Total", etc.
-   Rules:
-   - If quantity is missing but amount is present:
-         quantity = 1.0
-         rate = amount
-   - If rate is missing but quantity and amount are present:
-         rate = amount / quantity (rounded sensibly).
-   - If any numeric field is blank/unreadable:
-         use 0.0 (not null / empty string).
-   - Use numeric JSON values only (e.g. 1200.5, not "1,200.5").
+You will see K page images in this batch, in order.
+For EACH page i in this batch (1-based):
 
-5. PAGE TYPE
-   For each page in this batch, set:
-       page_type = "Bill Detail" | "Final Bill" | "Pharmacy"
+- Decide page_type ∈ {"Bill Detail", "Final Bill", "Pharmacy"}.
+- Extract ALL line items for that page (one per visual row).
 
-   - "Bill Detail" → general pages with mixed charges tables.
-   - "Pharmacy"    → pages dominated by medicines/drugs.
-   - "Final Bill"  → summary pages with totals and sometimes compressed lines.
-
-Choose the most appropriate label per page.
-
----------------- OUTPUT STRUCTURE (PER BATCH) ----------------
-
-You MUST output ONE SINGLE JSON OBJECT:
+Return ONE STRICT JSON object ONLY (no markdown):
 
 {
   "pagewise_line_items": [
@@ -361,30 +309,19 @@ You MUST output ONE SINGLE JSON OBJECT:
           "item_quantity": <float>
         }
       ]
-    },
-    {
-      "page_no": "2",
-      "page_type": "Bill Detail" | "Final Bill" | "Pharmacy",
-      "bill_items": [ ... ]
     }
   ],
   "total_item_count": <integer>
 }
 
-Where:
-- page_no is the 1-based index WITHIN THIS BATCH (as a STRING).
-- There must be exactly one object in pagewise_line_items for EACH page in this batch.
-- bill_items can be [] if a page has no charge lines.
-- total_item_count is the TOTAL number of items across ALL bill_items
-  on ALL pages in this batch.
+- page_no is the 1-based index WITHIN THIS BATCH, as a STRING.
+- bill_items may be [] for pages with no charges.
+- total_item_count is the number of bill_items across all pages in the batch.
 
 STRICT REQUIREMENTS:
-- Do NOT wrap the JSON in ``` or any markdown.
-- Do NOT add any keys other than pagewise_line_items and total_item_count
-  at the top level.
-- Do NOT add extra keys inside page objects or item objects.
-- Do NOT output totals, sub-totals, tax rows, or duplicate summary lines
-  as bill_items.
+- JSON ONLY. No ```json, no headings, no commentary.
+- No extra keys at top level or inside any object.
+- Do NOT output totals, sub-totals, taxes, or summary-only rows as bill_items.
 """
 
 
@@ -403,15 +340,12 @@ def call_groq_for_batch(
 You are given a BATCH of {num_batch_pages} page image(s) from a hospital bill.
 
 The images will be provided in order for this batch:
-    first image is batch page 1, second is batch page 2, ..., up to batch page {num_batch_pages}.
+first image is batch page 1, second is batch page 2, ..., up to batch page {num_batch_pages}.
 
 For EACH batch page i (1-based), you must:
 - Set page_no = "<i>" (as a string)
 - Choose page_type from: "Bill Detail", "Final Bill", "Pharmacy"
 - Extract bill_items ONLY for that page.
-
-Then return ONE combined JSON object for this batch, matching exactly the
-structure described in the system instructions.
 """
 
     user_content: List[Dict[str, Any]] = [
@@ -440,12 +374,7 @@ structure described in the system instructions.
             input=[
                 {
                     "role": "system",
-                    "content": [
-                        {
-                            "type": "input_text",
-                            "text": SYSTEM_PROMPT.strip(),
-                        }
-                    ],
+                    "content": [{"type": "input_text", "text": SYSTEM_PROMPT.strip()}],
                 },
                 {
                     "role": "user",
@@ -475,7 +404,7 @@ structure described in the system instructions.
 
     raw_text = response.output_text.strip()
 
-    # Robust JSON parsing
+    # Robust JSON parsing (strip fences if any)
     try:
         parsed = json.loads(raw_text)
     except json.JSONDecodeError:
@@ -526,9 +455,7 @@ structure described in the system instructions.
 # ============================================================
 
 def _coerce_number(x: Any) -> float:
-    """
-    Coerce a potentially messy numeric value (None, "", "—", etc.) to float.
-    """
+    """Coerce messy numeric value (None, '', '—', etc.) to float."""
     if x is None:
         return 0.0
     if isinstance(x, (int, float)):
@@ -549,12 +476,12 @@ def clean_page_dict(page_dict: Dict[str, Any]) -> Dict[str, Any]:
     """
     Pre-clean the raw JSON dict from the model so that Pydantic parsing will not
     fail when numeric fields are null/empty/etc.
-    Also performs within-page exact duplicate removal (same name + numbers).
+
+    IMPORTANT: We DO NOT dedupe within a page here – multiple identical rows
+    (e.g. many IP CONSULTATION CHARGES) must be preserved as separate items.
     """
     bill_items = page_dict.get("bill_items", []) or []
     cleaned_items: List[Dict[str, Any]] = []
-
-    seen_keys: Set[Tuple[str, float, float, float]] = set()
 
     for item in bill_items:
         if not isinstance(item, dict):
@@ -564,16 +491,6 @@ def clean_page_dict(page_dict: Dict[str, Any]) -> Dict[str, Any]:
         amount = _coerce_number(item.get("item_amount"))
         rate = _coerce_number(item.get("item_rate"))
         qty = _coerce_number(item.get("item_quantity"))
-
-        key = (
-            name.lower(),
-            round(amount, 2),
-            round(rate, 4),
-            round(qty, 4),
-        )
-        if key in seen_keys:
-            continue
-        seen_keys.add(key)
 
         cleaned_items.append(
             {
@@ -617,8 +534,7 @@ def reconcile_page_items(page_dict: Dict[str, Any]) -> PageItems:
             if math.isfinite(computed) and abs(computed - amount) > EPS:
                 item.item_amount = round(computed, 2)
         elif amount and qty and qty != 0:
-            computed_rate = amount / qty
-            item.item_rate = round(computed_rate, 4)
+            item.item_rate = round(amount / qty, 4)
         elif amount and (not qty or qty == 0):
             item.item_quantity = 1.0
             item.item_rate = round(amount, 2)
@@ -626,32 +542,70 @@ def reconcile_page_items(page_dict: Dict[str, Any]) -> PageItems:
     return page_items
 
 
-def dedupe_all_pages(pages: List[PageItems]) -> List[PageItems]:
+def enrich_from_patterns(pages: List[PageItems]) -> List[PageItems]:
     """
-    De-duplicate clearly repeated items across pages.
+    SECOND PASS (Option B):
+    If some rows have missing numeric fields, but other rows with the same
+    item_name have good numbers, use that pattern to fill in.
+
+    Example:
+        - Several 'IP CONSULTATION CHARGES' rows have amount=1000, qty=1.
+        - Others have amount=0 (unreadable). We set:
+              qty = 1, rate = 1000, amount = 1000.
     """
-    seen: Set[Tuple[str, str, float, float, float]] = set()
-    deduped_pages: List[PageItems] = []
+    # 1) Collect per-name statistics
+    rates = defaultdict(list)  # name -> list of inferred rates
+    qtys = defaultdict(list)   # name -> list of typical quantities
 
     for p in pages:
-        new_items: List[BillItem] = []
-        for item in p.bill_items:
-            key = (
-                p.page_type.strip().lower(),
-                item.item_name.strip().lower(),
-                round(float(item.item_rate), 4),
-                round(float(item.item_quantity), 4),
-                round(float(item.item_amount), 2),
-            )
-            if key in seen:
-                continue
-            seen.add(key)
-            new_items.append(item)
+        for it in p.bill_items:
+            name_key = it.item_name.strip().lower()
+            amt = float(it.item_amount)
+            rate = float(it.item_rate)
+            qty = float(it.item_quantity)
 
-        p.bill_items = new_items
-        deduped_pages.append(p)
+            if rate > 0 and qty > 0:
+                rates[name_key].append(rate)
+                qtys[name_key].append(qty)
+            elif amt > 0 and qty > 0:
+                rates[name_key].append(amt / qty)
+                qtys[name_key].append(qty)
 
-    return deduped_pages
+    default_rate = {
+        k: (sum(v) / len(v)) for k, v in rates.items() if v
+    }
+    default_qty = {
+        k: (sum(v) / len(v)) for k, v in qtys.items() if v
+    }
+
+    # 2) Fill missing fields using defaults
+    for p in pages:
+        for it in p.bill_items:
+            name_key = it.item_name.strip().lower()
+            amt = float(it.item_amount)
+            rate = float(it.item_rate)
+            qty = float(it.item_quantity)
+
+            dr = default_rate.get(name_key)
+            dq = default_qty.get(name_key, 1.0)
+
+            # Only try to "guess" when numbers are clearly missing / zero
+            if dr is not None:
+                if qty <= 0:
+                    qty = dq or 1.0
+                if rate <= 0 and amt > 0 and qty > 0:
+                    rate = amt / qty
+                if rate <= 0 and amt <= 0:
+                    rate = dr
+                if amt <= 0 and rate > 0 and qty > 0:
+                    amt = rate * qty
+
+            # Write back (rounded)
+            it.item_quantity = float(qty if qty > 0 else 1.0)
+            it.item_rate = round(float(rate), 2) if rate > 0 else 0.0
+            it.item_amount = round(float(amt), 2) if amt > 0 else 0.0
+
+    return pages
 
 
 def aggregate_all_pages(pages: List[PageItems]) -> ExtractBillDataResponseData:
@@ -671,7 +625,7 @@ def compute_grand_total_amount(pages: List[PageItems]) -> float:
 
 
 # ============================================================
-#  Health Check (GET) – handles evaluator GET pings
+#  Health Check (GET)
 # ============================================================
 
 @app.get("/extract-bill-data")
@@ -709,49 +663,30 @@ def extract_bill_data(req: ExtractBillDataRequest):
             message="No pages/images could be extracted from the document.",
         )
 
-    # 3. Build batches of ≤ MAX_IMAGES_PER_REQUEST
-    batches: List[Tuple[int, List[Dict[str, Any]]]] = []
-    for batch_start in range(0, num_pages, MAX_IMAGES_PER_REQUEST):
-        batch_end = min(batch_start + MAX_IMAGES_PER_REQUEST, num_pages)
-        batches.append((batch_start, page_infos[batch_start:batch_end]))
-
-    # 4. Call Groq in PARALLEL for each batch
-    all_pages_by_no: Dict[int, PageItems] = {}
+    # 3. Process pages in batches of <= MAX_IMAGES_PER_REQUEST
+    all_pages: List[PageItems] = []
     total_tokens = 0
     input_tokens = 0
     output_tokens = 0
 
-    max_workers = min(MAX_PARALLEL_BATCHES, len(batches))
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_to_batch_start = {
-            executor.submit(call_groq_for_batch, batch_page_infos): batch_start
-            for batch_start, batch_page_infos in batches
-        }
+    for batch_start in range(0, num_pages, MAX_IMAGES_PER_REQUEST):
+        batch_end = min(batch_start + MAX_IMAGES_PER_REQUEST, num_pages)
+        batch_page_infos = page_infos[batch_start:batch_end]
 
-        for future in as_completed(future_to_batch_start):
-            batch_start = future_to_batch_start[future]
-            try:
-                raw_pages_batch, usage_batch = future.result()
-            except HTTPException as e:
-                # Surface LLM-related / HTTP errors cleanly
-                raise e
-            except Exception as e:
-                raise HTTPException(
-                    status_code=500,
-                    detail=f"Internal error during LLM batch: {e}",
-                )
+        raw_pages_batch, usage_batch = call_groq_for_batch(batch_page_infos)
 
-            total_tokens += usage_batch.total_tokens
-            input_tokens += usage_batch.input_tokens
-            output_tokens += usage_batch.output_tokens
+        total_tokens += usage_batch.total_tokens
+        input_tokens += usage_batch.input_tokens
+        output_tokens += usage_batch.output_tokens
 
-            for i, page_dict in enumerate(raw_pages_batch):
-                global_page_no = batch_start + i + 1  # 1-based
-                page_dict["page_no"] = str(global_page_no)
-                page_items = reconcile_page_items(page_dict)
-                all_pages_by_no[global_page_no] = page_items
+        # Map batch-local page_no → global page_no
+        for i, page_dict in enumerate(raw_pages_batch):
+            global_page_no = batch_start + i + 1  # 1-based for entire document
+            page_dict["page_no"] = str(global_page_no)
+            page_items = reconcile_page_items(page_dict)
+            all_pages.append(page_items)
 
-    if not all_pages_by_no:
+    if not all_pages:
         elapsed = time.time() - start_time
         print(
             f"[BILL_EXTRACT] pages={num_pages} items=0 total_amount=0.00 "
@@ -767,24 +702,10 @@ def extract_bill_data(req: ExtractBillDataRequest):
             message="Model did not return any page items.",
         )
 
-    # Ensure pages are in correct global order and fill any missing with empty
-    all_pages: List[PageItems] = []
-    for page_no in range(1, num_pages + 1):
-        if page_no in all_pages_by_no:
-            all_pages.append(all_pages_by_no[page_no])
-        else:
-            all_pages.append(
-                PageItems(
-                    page_no=str(page_no),
-                    page_type="Bill Detail",
-                    bill_items=[],
-                )
-            )
+    # 4. Enrich missing numeric fields using global patterns (Option B)
+    all_pages = enrich_from_patterns(all_pages)
 
-    # 5. De-duplicate obviously repeated items across pages
-    all_pages = dedupe_all_pages(all_pages)
-
-    # 6. Aggregate
+    # 5. Aggregate
     data = aggregate_all_pages(all_pages)
 
     token_usage = TokenUsage(
@@ -793,9 +714,10 @@ def extract_bill_data(req: ExtractBillDataRequest):
         output_tokens=output_tokens,
     )
 
-    # 7. Logging
+    # 6. Logging
     grand_total = compute_grand_total_amount(all_pages)
     elapsed = time.time() - start_time
+
     print(
         f"[BILL_EXTRACT] pages={num_pages} "
         f"items={data.total_item_count} "
