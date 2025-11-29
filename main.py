@@ -38,10 +38,10 @@ GROQ_VISION_MODEL_MAVERICK = os.environ.get(
 )
 
 # Groq Vision limit: MAX 5 images per request
-MAX_IMAGES_PER_REQUEST = 5
+MAX_IMAGES_PER_REQUEST = 3
 
 # Max pages to refine with Maverick (speed control)
-MAX_MAVERICK_PAGES = 5
+MAX_MAVERICK_PAGES = 3
 
 
 # ============================================================
@@ -127,7 +127,7 @@ def guess_mime_type(url: str, content: bytes) -> str:
     return "application/octet-stream"
 
 
-def _resize_for_vision(img: Image.Image, max_dim: int = 850) -> Image.Image:
+def _resize_for_vision(img: Image.Image, max_dim: int = 650) -> Image.Image:
     """
     Downscale to reduce tokens & latency while keeping table details readable.
     Slightly smaller than before for better speed on 30+ pages.
@@ -145,7 +145,7 @@ def _enhance_for_vision(img: Image.Image) -> Image.Image:
     """
     Light contrast + sharpness boost to help faint numeric columns.
     """
-    img = ImageEnhance.Contrast(img).enhance(1.6)
+    img = ImageEnhance.Contrast(img).enhance(1.4)
     img = ImageEnhance.Sharpness(img).enhance(1.4)
     return img
 
@@ -198,7 +198,7 @@ def _compute_image_entropy(img: Image.Image) -> float:
     return float(entropy)
 
 
-def image_to_data_url(img: Image.Image, quality: int = 60) -> str:
+def image_to_data_url(img: Image.Image, quality: int = 45) -> str:
     """
     Convert a PIL Image into a base64 JPEG data URL.
 
@@ -971,7 +971,7 @@ def extract_bill_data(req: ExtractBillDataRequest):
 
             raw_page_mav, usage_mav = call_groq_for_single_page_maverick(
                 page_infos[idx],
-                ocr_text=ocr_text,
+                ocr_text=None,
             )
         except HTTPException as e:
             print(f"[MAVERICK_SKIP] page={idx+1} reason={e.detail}")
