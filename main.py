@@ -586,7 +586,7 @@ def _coerce_number(x: Any) -> float:
     return 0.0
 
 
-def clean_page_dict(page_dict: Dict[str, Any]) -> Dict[str, Any]]:
+def clean_page_dict(page_dict: Dict[str, Any]) -> Dict[str, Any]:
     """
     Pre-clean the raw JSON dict from the model so that Pydantic parsing will not
     fail when numeric fields are null/empty/etc.
