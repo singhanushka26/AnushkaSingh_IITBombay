@@ -1,7 +1,4 @@
-# ============================================================
-#  HIGH-ACCURACY + FAST + JSON-STABLE BILL EXTRACTION ENGINE
-# ============================================================
-
+# main.py
 import base64
 import io
 import json
@@ -19,23 +16,28 @@ from pdf2image import convert_from_bytes
 from PIL import Image, ImageEnhance
 from openai import OpenAI
 
-# ------------------------------------------------------------
-#                GROQ CLIENT
-# ------------------------------------------------------------
+# ============================================================
+#  Groq Client (OpenAI-compatible)
+# ============================================================
+
 client = OpenAI(
     api_key=os.environ.get("GROQ_API_KEY"),
     base_url="https://api.groq.com/openai/v1",
 )
 
-MODEL_FAST = "meta-llama/llama-4-scout-17b-16e-instruct"
-MODEL_ACCURATE = "meta-llama/llama-4-maverick-17b-128e-instruct"
+# Fast + good accuracy
+GROQ_VISION_MODEL_ID = os.environ.get(
+    "GROQ_VISION_MODEL_ID",
+    "meta-llama/llama-4-scout-17b-16e-instruct",
+)
 
+# Groq Vision limit: MAX 5 images per request
 MAX_IMAGES_PER_REQUEST = 5
 
 
-# ------------------------------------------------------------
-#                DATATHON SCHEMAS
-# ------------------------------------------------------------
+# ============================================================
+#  Pydantic Schemas – EXACT Datathon spec
+# ============================================================
 
 class BillItem(BaseModel):
     item_name: str
@@ -46,7 +48,7 @@ class BillItem(BaseModel):
 
 class PageItems(BaseModel):
     page_no: str
-    page_type: str
+    page_type: str  # "Bill Detail" | "Final Bill" | "Pharmacy"
     bill_items: List[BillItem]
 
 
@@ -72,32 +74,41 @@ class ExtractBillDataResponse(BaseModel):
     message: Optional[str] = None
 
 
-# ------------------------------------------------------------
-#                FASTAPI APP
-# ------------------------------------------------------------
+# ============================================================
+#  FastAPI App
+# ============================================================
 
 app = FastAPI(
-    title="High-Accuracy Bill Extraction API",
-    version="9.0.0",
-    description="Hybrid Scout + Maverick pipeline with guaranteed JSON safety."
+    title="Bajaj Datathon Bill Extraction API",
+    version="6.0.0",
+    description=(
+        "Extracts line items from multi-page bill/invoice documents using "
+        "Groq vision models with batching (max 5 images per request). "
+        "Implements the exact HackRx Datathon schema and is tuned for "
+        "high accuracy while staying under time limits on large PDFs."
+    ),
 )
 
 
-# ------------------------------------------------------------
-#                DOCUMENT HANDLING
-# ------------------------------------------------------------
+# ============================================================
+#  Helpers – Download & Convert Documents
+# ============================================================
 
 def download_document(url: str) -> bytes:
+    """Download the document from the given URL."""
     try:
-        r = requests.get(url, timeout=40)
-        r.raise_for_status()
-        return r.content
+        resp = requests.get(url, timeout=40)
+        resp.raise_for_status()
+        return resp.content
     except Exception as e:
-        raise HTTPException(400, f"Failed to download document: {e}")
+        raise HTTPException(
+            status_code=400,
+            detail=f"Failed to download document: {e}",
+        )
 
 
-def guess_mime(url: str | HttpUrl, content: bytes) -> str:
-    url = str(url)
+def guess_mime_type(url: str, content: bytes) -> str:
+    """Guess mime type based on URL extension or magic bytes."""
     mime, _ = mimetypes.guess_type(url)
     if mime:
         return mime
@@ -106,58 +117,126 @@ def guess_mime(url: str | HttpUrl, content: bytes) -> str:
     return "application/octet-stream"
 
 
+def _resize_for_vision(img: Image.Image, max_dim: int = 950) -> Image.Image:
+    """
+    Downscale to reduce tokens & latency while keeping table details readable.
+    Slightly smaller than before for better speed on 30+ pages.
+    """
+    w, h = img.size
+    scale = max(w, h) / float(max_dim)
+    if scale <= 1.0:
+        return img
+    new_w = int(w / scale)
+    new_h = int(h / scale)
+    return img.resize((new_w, new_h), Image.LANCZOS)
 
-def enhance(img: Image.Image) -> Image.Image:
-    img = ImageEnhance.Contrast(img).enhance(1.5)
+
+def _enhance_for_vision(img: Image.Image) -> Image.Image:
+    """
+    Light contrast + sharpness boost to help faint numeric columns
+    (like those IP CONSULTATION CHARGES pages).
+    """
+    img = ImageEnhance.Contrast(img).enhance(1.6)
     img = ImageEnhance.Sharpness(img).enhance(1.4)
     return img
 
 
-def resize(img: Image.Image) -> Image.Image:
-    max_dim = 950
-    w, h = img.size
-    s = max(w, h) / max_dim
-    if s <= 1:
-        return img
-    return img.resize((int(w / s), int(h / s)), Image.LANCZOS)
+def image_to_data_url(img: Image.Image, quality: int = 60) -> str:
+    """
+    Convert a PIL Image into a base64 JPEG data URL.
 
-
-def img_to_dataurl(img: Image.Image) -> str:
-    img = resize(img)
-    img = enhance(img)
+    - Resize to max_dim=950
+    - Slight enhancement
+    - JPEG quality ~60
+    - Ensure < 4 MB per image
+    """
+    img = _resize_for_vision(img, max_dim=950)
+    img = _enhance_for_vision(img)
 
     buf = io.BytesIO()
-    img.save(buf, "JPEG", quality=60)
-    data = buf.getvalue()
+    img.save(buf, format="JPEG", quality=quality)
+    b = buf.getvalue()
 
-    while len(data) > 4 * 1024 * 1024:
+    while len(b) > 4 * 1024 * 1024 and quality > 30:
+        quality -= 10
         buf = io.BytesIO()
-        img.save(buf, "JPEG", quality=40)
-        data = buf.getvalue()
+        img.save(buf, format="JPEG", quality=quality)
+        b = buf.getvalue()
 
-    return "data:image/jpeg;base64," + base64.b64encode(data).decode()
+    b64 = base64.b64encode(b).decode("utf-8")
+    return f"data:image/jpeg;base64,{b64}"
 
 
-def document_to_images(url: str | HttpUrl, content: bytes) -> List[str]:
-    url = str(url)
-    mime = guess_mime(url, content)
+def document_to_page_infos(url: str, content: bytes) -> List[Dict[str, Any]]:
+    """
+    Convert the downloaded document into a list of PAGE INFOS:
 
+        {
+          "page_index": int,   # 0-based
+          "data_url": "data:image/jpeg;base64,..."
+        }
+    """
+    mime = guess_mime_type(url, content)
+    page_infos: List[Dict[str, Any]] = []
+
+    # Single images
     if mime.startswith("image/"):
-        img = Image.open(io.BytesIO(content)).convert("RGB")
-        return [img_to_dataurl(img)]
+        try:
+            img = Image.open(io.BytesIO(content)).convert("RGB")
+        except Exception as e:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unable to open image document: {e}",
+            )
 
+        page_infos.append(
+            {
+                "page_index": 0,
+                "data_url": image_to_data_url(img),
+            }
+        )
+        return page_infos
+
+    # PDFs
     if mime == "application/pdf":
-        pages = convert_from_bytes(content)
-        return [img_to_dataurl(p.convert("RGB")) for p in pages]
+        try:
+            pages = convert_from_bytes(content)
+        except Exception as e:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Unable to convert PDF to images. "
+                    "Ensure poppler is installed and available in PATH. "
+                    f"Error: {e}"
+                ),
+            )
 
-    img = Image.open(io.BytesIO(content)).convert("RGB")
-    return [img_to_dataurl(img)]
+        for idx, p in enumerate(pages):
+            img = p.convert("RGB")
+            page_infos.append(
+                {
+                    "page_index": idx,
+                    "data_url": image_to_data_url(img),
+                }
+            )
+        return page_infos
 
+    # Fallback: try as image anyway
+    try:
+        img = Image.open(io.BytesIO(content)).convert("RGB")
+    except Exception:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported document type: {mime}",
+        )
 
-
-# ------------------------------------------------------------
-#            SYSTEM PROMPTS (FAST + ACCURATE)
-# ------------------------------------------------------------
+    page_infos.append(
+        {
+            "page_index": 0,
+            "data_url": image_to_data_url(img),
+        }
+    )
+    return page_infos
 
 
 # ============================================================
@@ -246,242 +325,409 @@ STRICT REQUIREMENTS:
 """
 
 
-SYSTEM_PROMPT_ACCURATE = """
-Re-check this page with MAXIMUM ACCURACY.
-Extract ALL real line items, not totals.
-STRICT JSON ONLY.
+def call_groq_for_batch(
+    batch_page_infos: List[Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], TokenUsage]:
+    """
+    Single Groq Vision call for a batch of pages (size <= MAX_IMAGES_PER_REQUEST).
+    Returns:
+        - raw_pages: list of per-page dicts (page_no, page_type, bill_items)
+        - token_usage: TokenUsage for this batch
+    """
+    num_batch_pages = len(batch_page_infos)
+
+    user_text = f"""
+You are given a BATCH of {num_batch_pages} page image(s) from a hospital bill.
+
+The images will be provided in order for this batch:
+first image is batch page 1, second is batch page 2, ..., up to batch page {num_batch_pages}.
+
+For EACH batch page i (1-based), you must:
+- Set page_no = "<i>" (as a string)
+- Choose page_type from: "Bill Detail", "Final Bill", "Pharmacy"
+- Extract bill_items ONLY for that page.
 """
 
+    user_content: List[Dict[str, Any]] = [
+        {"type": "input_text", "text": user_text.strip()}
+    ]
 
-# ------------------------------------------------------------
-#               ROBUST JSON PARSER  (never fails)
-# ------------------------------------------------------------
+    for idx, info in enumerate(batch_page_infos):
+        batch_page_no = idx + 1
+        user_content.append(
+            {
+                "type": "input_text",
+                "text": f"BATCH PAGE {batch_page_no} IMAGE BELOW.",
+            }
+        )
+        user_content.append(
+            {
+                "type": "input_image",
+                "image_url": info["data_url"],
+                "detail": "auto",
+            }
+        )
 
-def safe_json_parse(text: str) -> dict:
-    text = text.strip()
-
-    # Remove markdown fencing if exists
-    text = text.replace("```json", "").replace("```", "")
-
-    first = text.find("{")
-    last = text.rfind("}")
-    if first == -1 or last == -1:
-        raise HTTPException(500, "No JSON object found in response")
-
-    block = text[first:last + 1]
     try:
-        return json.loads(block)
-    except Exception:
-        # Try to clean trailing garbage
-        block = block.replace("\n", " ").replace("\t", " ")
-        return json.loads(block)
-
-
-# ------------------------------------------------------------
-#               GROQ CALL
-# ------------------------------------------------------------
-
-def groq_call(model: str, system_msg: str, messages: List[dict]) -> Tuple[dict, TokenUsage]:
-    try:
-        resp = client.responses.create(
-            model=model,
-            input=messages
+        response = client.responses.create(
+            model=GROQ_VISION_MODEL_ID,
+            input=[
+                {
+                    "role": "system",
+                    "content": [{"type": "input_text", "text": SYSTEM_PROMPT.strip()}],
+                },
+                {
+                    "role": "user",
+                    "content": user_content,
+                },
+            ],
         )
     except Exception as e:
-        raise HTTPException(503, f"Groq error: {e}")
+        raise HTTPException(
+            status_code=503,
+            detail=f"Groq API error: {e}",
+        )
 
-    raw = resp.output_text
-    parsed = safe_json_parse(raw)
+    usage = getattr(response, "usage", None)
+    if usage is not None:
+        total_tokens = int(getattr(usage, "total_tokens", 0) or 0)
+        input_tokens = int(getattr(usage, "input_tokens", 0) or 0)
+        output_tokens = int(getattr(usage, "output_tokens", 0) or 0)
+    else:
+        total_tokens = input_tokens = output_tokens = 0
 
-    u = resp.usage
-    t = TokenUsage(
-        total_tokens=int(getattr(u, "total_tokens", 0)),
-        input_tokens=int(getattr(u, "input_tokens", 0)),
-        output_tokens=int(getattr(u, "output_tokens", 0)),
+    token_usage = TokenUsage(
+        total_tokens=total_tokens,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
     )
-    return parsed, t
 
+    raw_text = response.output_text.strip()
 
-# ------------------------------------------------------------
-#               CLEANING + FIXING
-# ------------------------------------------------------------
-
-def num(x):
-    if x in [None, "", "-", "—"]:
-        return 0.0
+    # Robust JSON parsing (strip fences if any)
     try:
-        return float(str(x).replace(",", ""))
-    except:
+        parsed = json.loads(raw_text)
+    except json.JSONDecodeError:
+        first = raw_text.find("{")
+        last = raw_text.rfind("}")
+        if first != -1 and last != -1 and last > first:
+            json_str = raw_text[first:last + 1]
+            try:
+                parsed = json.loads(json_str)
+            except Exception:
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Model response is not valid JSON: {raw_text[:200]}",
+                )
+        else:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Model response is not valid JSON: {raw_text[:200]}",
+            )
+
+    if isinstance(parsed, dict) and "pagewise_line_items" in parsed:
+        raw_pages = parsed.get("pagewise_line_items", []) or []
+    elif isinstance(parsed, list):
+        raw_pages = parsed
+    else:
+        raise HTTPException(
+            status_code=500,
+            detail="Model JSON for batch does not contain 'pagewise_line_items' list.",
+        )
+
+    # Guarantee one page object per input page in this batch
+    if len(raw_pages) < num_batch_pages:
+        for idx in range(len(raw_pages), num_batch_pages):
+            raw_pages.append(
+                {
+                    "page_no": str(idx + 1),
+                    "page_type": "Bill Detail",
+                    "bill_items": [],
+                }
+            )
+
+    raw_pages = raw_pages[:num_batch_pages]
+    return raw_pages, token_usage
+
+
+# ============================================================
+#  Reconcile, Clean & Aggregate
+# ============================================================
+
+def _coerce_number(x: Any) -> float:
+    """Coerce messy numeric value (None, '', '—', etc.) to float."""
+    if x is None:
         return 0.0
+    if isinstance(x, (int, float)):
+        return float(x)
+    if isinstance(x, str):
+        s = x.strip()
+        if s == "" or s in {"-", "—", "NA", "N/A"}:
+            return 0.0
+        s = s.replace(",", "")
+        try:
+            return float(s)
+        except Exception:
+            return 0.0
+    return 0.0
 
 
-def fix_page_values(page: PageItems):
-    for it in page.bill_items:
-        amt = it.item_amount
-        rate = it.item_rate
-        qty = it.item_quantity
+def clean_page_dict(page_dict: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Pre-clean the raw JSON dict from the model so that Pydantic parsing will not
+    fail when numeric fields are null/empty/etc.
 
-        if rate > 0 and qty > 0:
-            it.item_amount = round(rate * qty, 2)
-        elif amt > 0 and qty > 0:
-            it.item_rate = round(amt / qty, 4)
-        elif amt > 0:
-            it.item_quantity = 1.0
-            it.item_rate = round(amt, 2)
-    return page
+    IMPORTANT: We DO NOT dedupe within a page here – multiple identical rows
+    (e.g. many IP CONSULTATION CHARGES) must be preserved as separate items.
+    """
+    bill_items = page_dict.get("bill_items", []) or []
+    cleaned_items: List[Dict[str, Any]] = []
+
+    for item in bill_items:
+        if not isinstance(item, dict):
+            continue
+
+        name = str(item.get("item_name", "")).strip()
+        amount = _coerce_number(item.get("item_amount"))
+        rate = _coerce_number(item.get("item_rate"))
+        qty = _coerce_number(item.get("item_quantity"))
+
+        cleaned_items.append(
+            {
+                "item_name": name,
+                "item_amount": amount,
+                "item_rate": rate,
+                "item_quantity": qty,
+            }
+        )
+
+    return {
+        "page_no": str(page_dict.get("page_no", "")),
+        "page_type": str(page_dict.get("page_type", "Bill Detail")),
+        "bill_items": cleaned_items,
+    }
 
 
-def enrich_missing_values(pages: List[PageItems]):
-    rates = defaultdict(list)
-    qtys = defaultdict(list)
+def reconcile_page_items(page_dict: Dict[str, Any]) -> PageItems:
+    """
+    Validate and normalize a single page's JSON dict into PageItems.
+    Fix small inconsistencies between rate, qty and amount.
+    """
+    cleaned = clean_page_dict(page_dict)
 
-    # collect patterns
+    try:
+        page_items = PageItems(**cleaned)
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Model JSON does not match expected schema: {e}",
+        )
+
+    EPS = 0.01
+    for item in page_items.bill_items:
+        amount = float(item.item_amount)
+        rate = float(item.item_rate)
+        qty = float(item.item_quantity)
+
+        if rate and qty:
+            computed = rate * qty
+            if math.isfinite(computed) and abs(computed - amount) > EPS:
+                item.item_amount = round(computed, 2)
+        elif amount and qty and qty != 0:
+            item.item_rate = round(amount / qty, 4)
+        elif amount and (not qty or qty == 0):
+            item.item_quantity = 1.0
+            item.item_rate = round(amount, 2)
+
+    return page_items
+
+
+def enrich_from_patterns(pages: List[PageItems]) -> List[PageItems]:
+    """
+    SECOND PASS (Option B):
+    If some rows have missing numeric fields, but other rows with the same
+    item_name have good numbers, use that pattern to fill in.
+
+    Example:
+        - Several 'IP CONSULTATION CHARGES' rows have amount=1000, qty=1.
+        - Others have amount=0 (unreadable). We set:
+              qty = 1, rate = 1000, amount = 1000.
+    """
+    # 1) Collect per-name statistics
+    rates = defaultdict(list)  # name -> list of inferred rates
+    qtys = defaultdict(list)   # name -> list of typical quantities
+
     for p in pages:
         for it in p.bill_items:
-            name = it.item_name.lower()
-            if it.item_rate > 0 and it.item_quantity > 0:
-                rates[name].append(it.item_rate)
-                qtys[name].append(it.item_quantity)
+            name_key = it.item_name.strip().lower()
+            amt = float(it.item_amount)
+            rate = float(it.item_rate)
+            qty = float(it.item_quantity)
 
-    avg_rate = {k: sum(v) / len(v) for k, v in rates.items()}
-    avg_qty = {k: sum(v) / len(v) for k, v in qtys.items()}
+            if rate > 0 and qty > 0:
+                rates[name_key].append(rate)
+                qtys[name_key].append(qty)
+            elif amt > 0 and qty > 0:
+                rates[name_key].append(amt / qty)
+                qtys[name_key].append(qty)
 
-    # fill missing
+    default_rate = {
+        k: (sum(v) / len(v)) for k, v in rates.items() if v
+    }
+    default_qty = {
+        k: (sum(v) / len(v)) for k, v in qtys.items() if v
+    }
+
+    # 2) Fill missing fields using defaults
     for p in pages:
         for it in p.bill_items:
-            name = it.item_name.lower()
-            if it.item_rate <= 0 and name in avg_rate:
-                it.item_rate = avg_rate[name]
-            if it.item_quantity <= 0 and name in avg_qty:
-                it.item_quantity = avg_qty[name]
-            if it.item_amount <= 0:
-                it.item_amount = it.item_rate * it.item_quantity
+            name_key = it.item_name.strip().lower()
+            amt = float(it.item_amount)
+            rate = float(it.item_rate)
+            qty = float(it.item_quantity)
+
+            dr = default_rate.get(name_key)
+            dq = default_qty.get(name_key, 1.0)
+
+            # Only try to "guess" when numbers are clearly missing / zero
+            if dr is not None:
+                if qty <= 0:
+                    qty = dq or 1.0
+                if rate <= 0 and amt > 0 and qty > 0:
+                    rate = amt / qty
+                if rate <= 0 and amt <= 0:
+                    rate = dr
+                if amt <= 0 and rate > 0 and qty > 0:
+                    amt = rate * qty
+
+            # Write back (rounded)
+            it.item_quantity = float(qty if qty > 0 else 1.0)
+            it.item_rate = round(float(rate), 2) if rate > 0 else 0.0
+            it.item_amount = round(float(amt), 2) if amt > 0 else 0.0
 
     return pages
 
 
-# ------------------------------------------------------------
-#                WHAT PAGES NEED ACCURATE RECHECK?
-# ------------------------------------------------------------
-
-def detect_suspicious(page: PageItems) -> bool:
-    """
-    We trigger Maverick re-check on pages:
-    - with < 2 rows
-    - OR with many repeated noisy rows
-    - OR with >50% zero-valued items
-    """
-
-    total = len(page.bill_items)
-    if total <= 1:
-        return True
-
-    zero_count = sum(1 for it in page.bill_items if it.item_amount <= 0)
-    if zero_count / max(total, 1) > 0.4:
-        return True
-
-    # Repeated names
-    names = [it.item_name.lower() for it in page.bill_items]
-    if len(names) - len(set(names)) > 5:
-        return True
-
-    return False
+def aggregate_all_pages(pages: List[PageItems]) -> ExtractBillDataResponseData:
+    total_items = sum(len(p.bill_items) for p in pages)
+    return ExtractBillDataResponseData(
+        pagewise_line_items=pages,
+        total_item_count=total_items,
+    )
 
 
-# ------------------------------------------------------------
-#               API ENDPOINTS
-# ------------------------------------------------------------
+def compute_grand_total_amount(pages: List[PageItems]) -> float:
+    total = 0.0
+    for p in pages:
+        for item in p.bill_items:
+            total += float(item.item_amount)
+    return round(total, 2)
+
+
+# ============================================================
+#  Health Check (GET)
+# ============================================================
 
 @app.get("/extract-bill-data")
-def health():
-    return {"message": "OK"}
+def health_check():
+    return {
+        "message": "Health OK. Use POST /extract-bill-data with JSON body "
+                   '{"document": "<public image/PDF URL>"} to extract bill data.'
+    }
 
+
+# ============================================================
+#  Main Datathon Endpoint (POST)
+# ============================================================
 
 @app.post("/extract-bill-data", response_model=ExtractBillDataResponse)
-def extract_api(req: ExtractBillDataRequest):
-    t0 = time.time()
+def extract_bill_data(req: ExtractBillDataRequest):
+    start_time = time.time()
+    url_str = str(req.document)
 
-    content = download_document(req.document)
-    imgs = document_to_images(str(req.document), content)
-    n = len(imgs)
+    # 1. Download document
+    content = download_document(url_str)
 
-    pages: List[PageItems] = []
-    total_usage = TokenUsage(0, 0, 0)
+    # 2. Convert to per-page infos (image → data_url)
+    page_infos = document_to_page_infos(url_str, content)
+    num_pages = len(page_infos)
 
-    # -----------------------------
-    #       SCOUT BATCH PASS
-    # -----------------------------
-    for i in range(0, n, MAX_IMAGES_PER_REQUEST):
-        batch = imgs[i:i + MAX_IMAGES_PER_REQUEST]
+    if num_pages == 0:
+        elapsed = time.time() - start_time
+        print(
+            f"[BILL_EXTRACT] pages=0 items=0 total_amount=0.00 tokens=0 "
+            f"time_sec={elapsed:.2f} (no pages)"
+        )
+        return ExtractBillDataResponse(
+            is_success=False,
+            message="No pages/images could be extracted from the document.",
+        )
 
-        messages = [
-            {
-                "role": "system",
-                "content": [{"type": "input_text", "text": SYSTEM_PROMPT}]
-            },
-            {
-                "role": "user",
-                "content": [{"type": "input_text", "text": f"Process {len(batch)} pages"}]
-            }
-        ]
+    # 3. Process pages in batches of <= MAX_IMAGES_PER_REQUEST
+    all_pages: List[PageItems] = []
+    total_tokens = 0
+    input_tokens = 0
+    output_tokens = 0
 
-        for j, img in enumerate(batch):
-            messages[-1]["content"].append({"type": "input_image", "image_url": img, "detail": "auto"})
+    for batch_start in range(0, num_pages, MAX_IMAGES_PER_REQUEST):
+        batch_end = min(batch_start + MAX_IMAGES_PER_REQUEST, num_pages)
+        batch_page_infos = page_infos[batch_start:batch_end]
 
-        parsed, use = groq_call(MODEL_FAST, SYSTEM_PROMPT, messages)
-        total_usage.total_tokens += use.total_tokens
-        total_usage.input_tokens += use.input_tokens
-        total_usage.output_tokens += use.output_tokens
+        raw_pages_batch, usage_batch = call_groq_for_batch(batch_page_infos)
 
-        raw_pages = parsed.get("pagewise_line_items", parsed)
+        total_tokens += usage_batch.total_tokens
+        input_tokens += usage_batch.input_tokens
+        output_tokens += usage_batch.output_tokens
 
-        # normalize
-        for k, p in enumerate(raw_pages):
-            p["page_no"] = str(i + k + 1)
-            pages.append(PageItems(**p))
+        # Map batch-local page_no → global page_no
+        for i, page_dict in enumerate(raw_pages_batch):
+            global_page_no = batch_start + i + 1  # 1-based for entire document
+            page_dict["page_no"] = str(global_page_no)
+            page_items = reconcile_page_items(page_dict)
+            all_pages.append(page_items)
 
-    # -----------------------------
-    #   ACCURATE RECHECK (MAVERICK)
-    # -----------------------------
-    for idx, p in enumerate(pages):
-        if not detect_suspicious(p):
-            continue
+    if not all_pages:
+        elapsed = time.time() - start_time
+        print(
+            f"[BILL_EXTRACT] pages={num_pages} items=0 total_amount=0.00 "
+            f"tokens={total_tokens} time_sec={elapsed:.2f} (no items)"
+        )
+        return ExtractBillDataResponse(
+            is_success=False,
+            token_usage=TokenUsage(
+                total_tokens=total_tokens,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+            ),
+            message="Model did not return any page items.",
+        )
 
-        img = imgs[idx]
+    # 4. Enrich missing numeric fields using global patterns (Option B)
+    all_pages = enrich_from_patterns(all_pages)
 
-        messages = [
-            {
-                "role": "system",
-                "content": [{"type": "input_text", "text": SYSTEM_PROMPT_ACCURATE}]
-            },
-            {
-                "role": "user",
-                "content": [{"type": "input_image", "image_url": img, "detail": "high"}]
-            }
-        ]
+    # 5. Aggregate
+    data = aggregate_all_pages(all_pages)
 
-        parsed, use = groq_call(MODEL_ACCURATE, SYSTEM_PROMPT_ACCURATE, messages)
+    token_usage = TokenUsage(
+        total_tokens=total_tokens,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+    )
 
-        total_usage.total_tokens += use.total_tokens
-        total_usage.input_tokens += use.input_tokens
-        total_usage.output_tokens += use.output_tokens
+    # 6. Logging
+    grand_total = compute_grand_total_amount(all_pages)
+    elapsed = time.time() - start_time
 
-        parsed["page_no"] = str(idx + 1)
-        pages[idx] = PageItems(**parsed)
-
-    # -----------------------------
-    #       CLEANUP & ENRICH
-    # -----------------------------
-    pages = [fix_page_values(p) for p in pages]
-    pages = enrich_missing_values(pages)
-
-    total_items = sum(len(p.bill_items) for p in pages)
-    data = ExtractBillDataResponseData(pagewise_line_items=pages, total_item_count=total_items)
-
-    print(f"[BILL] pages={n} items={total_items} tokens={total_usage.total_tokens} time={time.time()-t0:.2f}s")
+    print(
+        f"[BILL_EXTRACT] pages={num_pages} "
+        f"items={data.total_item_count} "
+        f"total_amount={grand_total:.2f} "
+        f"tokens={token_usage.total_tokens} "
+        f"time_sec={elapsed:.2f}"
+    )
 
     return ExtractBillDataResponse(
         is_success=True,
-        token_usage=total_usage,
-        data=data
+        token_usage=token_usage,
+        data=data,
     )
