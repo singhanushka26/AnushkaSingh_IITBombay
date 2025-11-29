@@ -28,7 +28,7 @@ client = OpenAI(
 # Fast + good accuracy
 GROQ_VISION_MODEL_ID = os.environ.get(
     "GROQ_VISION_MODEL_ID",
-    "meta-llama/llama-4-vision-preview",
+    "llama-3.2-90b-vision-q",
 )
 
 # Groq Vision limit: MAX 5 images per request
