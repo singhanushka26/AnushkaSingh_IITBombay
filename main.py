@@ -5,7 +5,8 @@ import json
 import math
 import mimetypes
 import os
-import re
+import time
+import logging
 from typing import List, Optional, Tuple, Any, Dict, Set
 
 import requests
@@ -16,6 +17,12 @@ from PIL import Image, ImageStat
 from openai import OpenAI
 
 # ============================================================
+#  Logging (for Railway logs)
+# ============================================================
+
+logger = logging.getLogger("uvicorn.error")
+
+# ============================================================
 #  Groq Client (OpenAI-compatible)
 # ============================================================
 
@@ -24,13 +31,19 @@ client = OpenAI(
     base_url="https://api.groq.com/openai/v1",
 )
 
+# Vision model (multimodal, good for production)
+# For maximum accuracy we keep Maverick as default.
 GROQ_VISION_MODEL_ID = os.environ.get(
     "GROQ_VISION_MODEL_ID",
     "meta-llama/llama-4-maverick-17b-128e-instruct",
 )
 
+# Hard accuracy mode flag (kept for future tuning if needed)
+HARD_ACCURACY_MODE = True  # keep True for Datathon
+
+
 # ============================================================
-#  Pydantic Schemas – EXACT Datathon spec
+#  Pydantic Schemas – EXACTLY as per Datathon spec
 # ============================================================
 
 class BillItem(BaseModel):
@@ -74,13 +87,33 @@ class ExtractBillDataResponse(BaseModel):
 
 app = FastAPI(
     title="Bajaj Datathon Bill Extraction API",
-    version="4.0.0",
+    version="3.1.0",
     description=(
-        "Hybrid Vision + OCR pipeline for extracting line items from medical bills. "
-        "Strictly follows HackRx Datathon response schema and focuses on high recall "
-        "with minimal double-counting."
+        "Extracts line items from bill / invoice documents using Groq vision models "
+        "with Tesseract OCR assistance. Implements the exact response schema "
+        "required by HackRx Datathon and is tuned to minimize missed items and "
+        "double counting while matching the printed bill totals."
     ),
 )
+
+
+# ============================================================
+#  Health Check (GET) – returns 200 OK
+# ============================================================
+
+@app.get("/extract-bill-data")
+def health_check():
+    """
+    Simple health check for evaluators / monitoring.
+    Does NOT perform any extraction – just tells clients how to use the API.
+    """
+    return {
+        "status": "alive",
+        "message": (
+            "Use POST /extract-bill-data with JSON body: "
+            '{"document": "<public URL to image or PDF>"}'
+        ),
+    }
 
 
 # ============================================================
@@ -88,12 +121,19 @@ app = FastAPI(
 # ============================================================
 
 def download_document(url: str) -> bytes:
-    """Download the document from the given URL."""
+    """
+    Download the document from the given URL.
+    Supports:
+    - Direct image URLs (png, jpg, jpeg, webp, etc.)
+    - Direct PDF URLs
+    - Public file links that resolve to the above
+    """
     try:
         resp = requests.get(url, timeout=40)
         resp.raise_for_status()
         return resp.content
     except Exception as e:
+        logger.error(f"[DOWNLOAD_ERROR] url={url} error={e}")
         raise HTTPException(
             status_code=400,
             detail=f"Failed to download document: {e}",
@@ -101,17 +141,24 @@ def download_document(url: str) -> bytes:
 
 
 def guess_mime_type(url: str, content: bytes) -> str:
-    """Guess mime type based on URL extension or magic bytes."""
+    """
+    Guess mime type based on URL extension or magic bytes.
+    """
     mime, _ = mimetypes.guess_type(url)
     if mime:
         return mime
+
     if content[:4] == b"%PDF":
         return "application/pdf"
+
     return "application/octet-stream"
 
 
 def _resize_for_vision(img: Image.Image, max_dim: int = 1600) -> Image.Image:
-    """Downscale large images for speed + token control."""
+    """
+    Light downscale to reduce tokens & latency while keeping details.
+    Keeps aspect ratio. Only downsizes if larger than max_dim.
+    """
     w, h = img.size
     scale = max(w, h) / float(max_dim)
     if scale <= 1.0:
@@ -124,14 +171,17 @@ def _resize_for_vision(img: Image.Image, max_dim: int = 1600) -> Image.Image:
 def image_to_data_url(img: Image.Image, quality: int = 80) -> str:
     """
     Convert a PIL Image into a base64 JPEG data URL.
-    Groq limits base64 images to ~4MB – adaptively reduce quality.
+
+    Groq limits base64 images to ~4MB – adaptively reduce JPEG quality.
     """
+    # Optional resize for speed/token control
     img = _resize_for_vision(img, max_dim=1600)
 
     buf = io.BytesIO()
     img.save(buf, format="JPEG", quality=quality)
     b = buf.getvalue()
 
+    # Adaptive compression loop
     while len(b) > 4 * 1024 * 1024 and quality > 40:
         quality -= 10
         buf = io.BytesIO()
@@ -147,7 +197,8 @@ def image_to_data_url(img: Image.Image, quality: int = 80) -> str:
 def extract_ocr_text(img: Image.Image) -> str:
     """
     Run Tesseract OCR on the given image.
-    Hybrid approach: if pytesseract is missing, gracefully fall back to "".
+
+    If pytesseract or Tesseract is not available, returns "" silently.
     """
     try:
         import pytesseract
@@ -163,10 +214,15 @@ def extract_ocr_text(img: Image.Image) -> str:
 
 def is_mostly_blank(img: Image.Image, ocr_text: str) -> bool:
     """
-    Conservative blank-page detector:
-    - If there is any decent OCR text → NOT blank
-    - Otherwise, use very high brightness + low variance threshold
+    Very conservative blank-page detector:
+    - High brightness AND
+    - very low variance AND
+    - almost no OCR text
+
+    To avoid missing any bill content, this function errs on the side
+    of treating pages as NON-blank.
     """
+    # If there is any non-trivial OCR text, treat as non-blank
     if len((ocr_text or "").strip()) > 50:
         return False
 
@@ -175,14 +231,16 @@ def is_mostly_blank(img: Image.Image, ocr_text: str) -> bool:
     mean = stat.mean[0] if stat.mean else 255.0
     var = stat.var[0] if stat.var else 0.0
 
+    # Very bright, very low-variance, and almost no text
     if mean > 248 and var < 5.0 and len((ocr_text or "").strip()) < 10:
         return True
+
     return False
 
 
 def document_to_page_infos(url: str, content: bytes) -> List[Dict[str, Any]]:
     """
-    Convert the downloaded document into list of PAGE INFOS:
+    Convert the downloaded document into a list of PAGE INFOS:
 
         {
           "pil_image": <PIL.Image>,
@@ -190,6 +248,9 @@ def document_to_page_infos(url: str, content: bytes) -> List[Dict[str, Any]]:
           "ocr_text": "...",
           "is_blank": bool
         }
+
+    - If image: one page.
+    - If PDF: one image per page.
     """
     mime = guess_mime_type(url, content)
     page_infos: List[Dict[str, Any]] = []
@@ -210,6 +271,7 @@ def document_to_page_infos(url: str, content: bytes) -> List[Dict[str, Any]]:
                 "pil_image": img,
                 "data_url": image_to_data_url(img),
                 "ocr_text": ocr_text,
+                # VERY conservative: we do not treat pages as blank lightly
                 "is_blank": is_mostly_blank(img, ocr_text),
             }
         )
@@ -224,7 +286,7 @@ def document_to_page_infos(url: str, content: bytes) -> List[Dict[str, Any]]:
                 status_code=400,
                 detail=(
                     "Unable to convert PDF to images. "
-                    "Ensure poppler is installed in the environment. "
+                    "Ensure poppler is installed and available in PATH. "
                     f"Error: {e}"
                 ),
             )
@@ -242,7 +304,7 @@ def document_to_page_infos(url: str, content: bytes) -> List[Dict[str, Any]]:
             )
         return page_infos
 
-    # Fallback: try as image
+    # Fallback: try as image anyway
     try:
         img = Image.open(io.BytesIO(content)).convert("RGB")
     except Exception:
@@ -264,136 +326,200 @@ def document_to_page_infos(url: str, content: bytes) -> List[Dict[str, Any]]:
 
 
 # ============================================================
-#  LLM Prompt – high recall + no double count
+#  LLM Prompt – OCR-aware, high-precision + no double-count
 # ============================================================
 
 SYSTEM_PROMPT = """
-You are an expert medical BILL ITEM extraction engine.
+You are an expert medical BILL ITEM extraction engine designed for an evaluation
+where BOTH of the following matter:
 
-Goals:
-1) Capture EVERY genuine line item (high recall).
-2) Avoid any double-counting of the same line item.
+1) Every genuine line item on the bill must be captured (high recall).
+2) There must be NO double counting or duplication of the same line item.
 
 The evaluator will:
-- Sum all `item_amount` across all pages.
-- Compare that to the printed FINAL TOTAL on the bill.
-- Check that each extracted line matches the bill tables.
+- Compare the sum of all your extracted `item_amount` values against the
+  FINAL TOTAL shown on the bill.
+- Check that your line items match the descriptions and numeric values printed
+  in the bill tables.
+Your goal is to make the AI-extracted total as close as possible to the actual
+bill final total WITHOUT missing items or double-counting.
 
-You get ONE PAGE IMAGE at a time.
-You MUST only use content that is visibly present on THIS PAGE.
-Do NOT invent items from other pages.
+---------- DOCUMENT STRUCTURE & TERMINOLOGY ----------
 
-A VALID line item row has:
-- A description of the service/test/medicine/charge.
-- A numeric amount (and usually quantity and rate).
+You are given a SINGLE PAGE IMAGE of a multi-page bill/invoice.
 
-Examples:
-- Bed/room charges
-- ICU / ward charges
-- Consultation/doctor charges
-- Pathology / radiology tests
-- Operation / procedure charges
-- IPD / OT / Nursing / Service charges
-- Pharmacy items (medicines, consumables, devices)
+Typical structure:
+- Hospital or clinic header (logo, name, address).
+- Patient information (name, age, ID, dates).
+- One or more TABLES containing charges:
+    * Investigations/Pathology/Lab tests
+    * Radiology / Imaging
+    * Procedures / Operation charges
+    * Consultation / Doctor visit charges
+    * Bed / Room / Ward charges
+    * Nursing, Maintenance, Service charges
+    * Pharmacy / Medicines
+- Optional sections with headings like:
+    "PATHOLOGY", "RADIOLOGY", "PHARMACY CHARGES", "BED CHARGES", etc.
+- Sub-total rows for each section.
+- Final summaries: "Total", "Grand Total", "Net Amount Payable",
+  "Amount Received", "Balance", "Discount", "GST", "CGST", "SGST", etc.
 
-NOT items (must be ignored):
-- Section headers: "PATHOLOGY", "RADIOLOGY", "PHARMACY CHARGES",
-  "BED CHARGES", "IPD CONSUMABLE CHARGES" if used as a heading only, etc.
-- Page headers with hospital / patient info.
-- Summary rows: "SUB TOTAL", "SUBTOTAL", "TOTAL", "GRAND TOTAL",
-  "NET AMOUNT", "NET AMOUNT PAYABLE", "TOTAL AMOUNT",
-  "DISCOUNT", "ROUND OFF", "GST", "CGST", "SGST", "IGST", "TAX".
+Definitions (VERY IMPORTANT):
+- A "LINE ITEM" is one logical row describing a single charge, such as:
+    - A CONCRETE test/procedure: "RENAL FUNCTION TEST (RFT)", "ELECTROLYTES"
+    - A bed charge: "Room Ward Charges", "ICU Bed Charges"
+    - A consultation: "IP CONSULTATION CHARGES (Dr. ...)"
+    - A pharmacy item: a medicine or drug name with qty, rate, and amount.
+- Each line item should have:
+    * item_name: textual description for that charge.
+    * item_quantity: how many units / days / hours, etc.
+    * item_rate: per-unit price.
+    * item_amount: net amount for that line item AFTER discounts, BEFORE tax
+      (use the number printed in the row for that item).
 
-These summaries can be used mentally to sanity-check totals but must
-NOT appear as bill_items.
+Section headers and totals:
+- Section titles like "PATHOLOGY", "RADIOLOGY", "PHARMACY CHARGES",
+  "BED CHARGES", "CONSULTATION", etc. are NOT items.
+- Summary/total rows like "Total PATHOLOGY", "LAB TOTAL", "PHARMACY TOTAL",
+  "SUB TOTAL", "TOTAL", "GRAND TOTAL", "NET AMOUNT PAYABLE", "ROUND OFF",
+  "GST", "CGST", "SGST", "IGST", "DISCOUNT", "TAX ON" are NOT items.
 
-NUMERIC FIELDS:
-- item_quantity → Qty / No. of days / units (default 1.0 if missing)
-- item_rate     → Rate / Unit price (if missing but quantity & amount known,
-                   infer rate = amount / quantity)
-- item_amount   → Net amount of that row, AFTER discount and BEFORE taxes.
+You MUST NOT output these rows as bill_items.
+Instead, you implicitly use them as a sanity check: the sum of your item_amount
+values for all rows on all pages should match these totals as closely as possible,
+but you do not output the total rows themselves.
 
-If any numeric field is unreadable, set it to 0.0 (never null/empty).
+---------- CRITICAL RULES: NO MISSING, NO DOUBLE COUNTING ----------
 
-page_type:
-- "Bill Detail" → detailed line items (most pages)
-- "Pharmacy"   → mainly medicines / consumables with qty, rate, amount
-- "Final Bill" → summary-style page with compressed items + final totals
+1. PROCESS ONLY THIS PAGE IMAGE.
+   - Do NOT invent items from other pages.
+   - Every JSON object must correspond to a visible row on THIS page.
 
-You MUST choose exactly one page_type for each page.
+2. DO NOT MISS items:
+   - For every visible row that clearly has a description + numeric amount,
+     you must extract one bill_items entry.
+   - If a row has no visible amount or is clearly not a charge (e.g., header),
+     skip it.
 
-Output STRICT JSON, no markdown, no explanations.
+3. DO NOT DOUBLE COUNT:
+   - If the same line item is repeated multiple times with the same description,
+     same quantity, same rate, and same amount (i.e., visually the same row only once),
+     output it ONLY ONCE.
+   - If the bill clearly lists the same item multiple times on separate rows
+     (e.g., same test done on different days), then you may output multiple entries
+     BUT only if they are really separate rows in the table.
+   - Never output multiple identical JSON objects that correspond to a SINGLE visual row.
+
+4. HANDLING QUANTITY / RATE / AMOUNT:
+   - item_quantity = numeric value under "Qty", "QTY", "QTY/Hrs", "No. of days", etc.
+   - item_rate     = numeric value under "Rate", "RATE", "Per day", "Charge", etc.
+   - item_amount   = numeric value under "Amount", "Amt (Rs.)", "Net Amt", "Total", etc.
+   - If quantity is clearly missing but there is a total amount for the row:
+       -> assume quantity = 1.0 and rate = amount.
+   - If rate is missing but quantity and amount are visible:
+       -> rate = amount / quantity (rounded sensibly).
+   - If a numeric field is BLANK / unreadable:
+       -> set it to 0.0 (do NOT use null or empty string).
+
+5. HANDLING SUB-TOTALS AND FINAL TOTAL:
+   - Sub-total rows (per section) and the final total row are NOT individual items.
+   - You may mentally cross-check that "sum of item_amount" for that section/page
+     roughly matches the sub-total shown, but you MUST NOT add them as bill_items.
+   - The final evaluation will compute:
+       AI_Total = sum of all item_amount across all bill_items in the entire document
+     and compare it to the printed final total on the bill.
+   - Your responsibility is to:
+       - include every genuine item row
+       - NOT double-count the same row
+       - ensure the numbers on each row are consistent with the bill.
+
+6. page_type classification:
+   - "Bill Detail"  → typical detailed list of line items (most pages).
+   - "Pharmacy"    → mainly medicines / drugs with Qty, Rate, Amount.
+   - "Final Bill"  → summary-style page that may repeat line items or show
+                     only a compressed version plus final totals.
+   Choose the best label FOR THIS PAGE ONLY.
+
+7. MULTIPLE TABLES ON THE SAME PAGE:
+   - If the page has multiple tables of charges (e.g., investigations + bed
+     charges + consultation), extract items from ALL of them.
+   - Still obey the rule: never treat section headers or totals as items.
+
+8. NUMERIC TYPES:
+   - All numeric fields must be valid JSON numbers (no null, no empty strings).
+   - Use "." as decimal separator.
+   - Do NOT put commas inside numbers (e.g., use 1200.5 not "1,200.5").
+
+---------- OUTPUT FORMAT (STRICT JSON) ----------
+
+You MUST output STRICT JSON (no markdown, no backticks) with this exact shape:
+
+{
+  "page_no": "<page number as string>",
+  "page_type": "<Bill Detail | Final Bill | Pharmacy>",
+  "bill_items": [
+    {
+      "item_name": "<string>",
+      "item_amount": <float>,
+      "item_rate": <float>,
+      "item_quantity": <float>
+    }
+  ]
+}
+
+Restrictions:
+- Do NOT wrap the JSON in ``` marks or any markdown.
+- Do NOT prefix with 'json' or any language tag.
+- Do NOT add extra keys at any level.
+- Do NOT output totals, sub-totals, or tax rows as bill_items.
+- Do NOT output the same (name, quantity, rate, amount) row multiple times
+  unless they clearly correspond to separate visible rows in the table.
 """
 
 
-# ========== Robust JSON Parsing / Repair ==========
-
-def _strip_code_fences(text: str) -> str:
-    """Remove ```json ... ``` fences if model adds them."""
-    s = text.strip()
-    if s.startswith("```"):
-        lines = s.splitlines()
-        # remove first fence line
-        if lines:
-            if lines[0].startswith("```"):
-                lines = lines[1:]
-        # remove trailing fence line
-        if lines and lines[-1].strip().startswith("```"):
-            lines = lines[:-1]
-        s = "\n".join(lines).strip()
-    return s
-
-
-def _best_effort_json_parse(raw_text: str) -> Dict[str, Any]:
+def _strip_markdown_fences(raw_text: str) -> str:
     """
-    Try very hard to parse model output as JSON:
-    - strip code fences
-    - cut to first '{' ... last '}'
-    - remove obvious trailing commas
-    - balance braces/brackets if needed
+    Remove leading/trailing ``` or ```json fences if the model
+    ignored instructions and wrapped the JSON in markdown.
     """
-    cleaned = _strip_code_fences(raw_text)
+    text = raw_text.strip()
 
-    # Focus on main JSON object segment
-    first = cleaned.find("{")
-    last = cleaned.rfind("}")
-    if first != -1 and last != -1 and last > first:
-        cleaned = cleaned[first:last + 1]
+    # Remove starting ``` or ```json or ``` json
+    if text.startswith("```"):
+        # Drop first line (``` or ```json)
+        parts = text.splitlines()
+        # Remove first line
+        if len(parts) > 1:
+            parts = parts[1:]
+        text = "\n".join(parts).strip()
 
-    # Remove trailing commas before closing } or ]
-    cleaned = re.sub(r",(\s*[}\]])", r"\1", cleaned)
+    # Remove trailing ``` if present
+    if text.endswith("```"):
+        text = text[:-3].strip()
 
-    # Balance braces / brackets if model truncated slightly
-    open_curly = cleaned.count("{")
-    close_curly = cleaned.count("}")
-    open_sq = cleaned.count("[")
-    close_sq = cleaned.count("]")
+    # Sometimes models start with 'json' or 'JSON' after fences
+    if text.lower().startswith("json"):
+        text = text[4:].lstrip()
 
-    if close_curly < open_curly:
-        cleaned += "}" * (open_curly - close_curly)
-    if close_sq < open_sq:
-        cleaned += "]" * (open_sq - close_sq)
-
-    # Final parse
-    return json.loads(cleaned)
+    return text
 
 
 def call_groq_for_page(
     page_no: int,
     image_data_url: str,
     ocr_text: str,
-    max_retries: int = 2,
 ) -> Tuple[Dict[str, Any], TokenUsage]:
     """
     Call Groq Vision model for a single page image, with OCR text as hint.
-    Uses retries + best-effort JSON repair for robustness.
     """
-    # truncate OCR snippet
-    ocr_text_snippet = (ocr_text or "").strip()
-    if len(ocr_text_snippet) > 1500:
-        ocr_text_snippet = ocr_text_snippet[:1500]
 
-    base_user_text = f"""
+    # Truncate OCR text to keep prompt size reasonable & fast
+    ocr_text_snippet = (ocr_text or "").strip()
+    if len(ocr_text_snippet) > 1200:  # shorter than before → faster, cheaper
+        ocr_text_snippet = ocr_text_snippet[:1200]
+
+    user_text = f"""
 You are processing page number {page_no} of a multi-page medical bill.
 
 Use page_no="{page_no}" in the JSON.
@@ -402,90 +528,113 @@ Classify page_type as exactly one of:
 - "Final Bill"
 - "Pharmacy"
 
-Below is OCR text extracted from THIS PAGE ONLY (may be noisy).
-Use it only as a helper; always respect the actual table structure.
+Below is OCR text extracted from THIS PAGE ONLY (may contain noise).
+Use it to help read small fonts and numbers, but always confirm by looking
+at the table structure in the image.
 
 OCR_TEXT_START
 {ocr_text_snippet}
 OCR_TEXT_END
 
 Remember:
-- Output ONLY items that visibly correspond to table rows on THIS PAGE.
-- DO NOT include totals / subtotals / GST / discounts / net amounts.
-- DO NOT invent items from other pages.
-- Output STRICT JSON, no markdown, no comments.
+- Extract ONLY item-level rows that are PHYSICALLY PRESENT in THIS PAGE IMAGE.
+- Do NOT bring items from other pages.
+- Do NOT miss any genuine line items.
+- Do NOT double-count the same line item.
 """
 
-    total_tokens = 0
-    input_tokens = 0
-    output_tokens = 0
-    last_error = None
+    try:
+        response = client.responses.create(
+            model=GROQ_VISION_MODEL_ID,
+            input=[
+                {
+                    "role": "system",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": SYSTEM_PROMPT.strip(),
+                        }
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": user_text.strip(),
+                        },
+                        {
+                            "type": "input_image",
+                            "image_url": image_data_url,
+                            "detail": "auto",
+                        },
+                    ],
+                },
+            ],
+        )
+    except Exception as e:
+        logger.error(f"[GROQ_ERROR] page={page_no} error={e}")
+        raise HTTPException(
+            status_code=503,
+            detail=f"Groq API error: {e}",
+        )
 
-    for attempt in range(max_retries + 1):
-        if attempt == 0:
-            user_text = base_user_text
-        else:
-            # Retry with an explicit correction instruction
-            user_text = (
-                base_user_text
-                + "\n\nYour previous response was not valid JSON. "
-                  "Now respond ONLY with a single valid JSON object, "
-                  "with balanced brackets and no markdown fences."
-            )
+    usage = getattr(response, "usage", None)
+    if usage is not None:
+        total_tokens = int(getattr(usage, "total_tokens", 0) or 0)
+        input_tokens = int(getattr(usage, "input_tokens", 0) or 0)
+        output_tokens = int(getattr(usage, "output_tokens", 0) or 0)
+    else:
+        total_tokens = input_tokens = output_tokens = 0
 
-        try:
-            response = client.responses.create(
-                model=GROQ_VISION_MODEL_ID,
-                input=[
-                    {
-                        "role": "system",
-                        "content": [
-                            {"type": "input_text", "text": SYSTEM_PROMPT.strip()},
-                        ],
-                    },
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "input_text", "text": user_text.strip()},
-                            {
-                                "type": "input_image",
-                                "image_url": image_data_url,
-                                "detail": "auto",
-                            },
-                        ],
-                    },
-                ],
-            )
-        except Exception as e:
-            last_error = f"Groq API error: {e}"
-            continue
-
-        usage = getattr(response, "usage", None)
-        if usage is not None:
-            total_tokens += int(getattr(usage, "total_tokens", 0) or 0)
-            input_tokens += int(getattr(usage, "input_tokens", 0) or 0)
-            output_tokens += int(getattr(usage, "output_tokens", 0) or 0)
-
-        raw_text = response.output_text or ""
-        raw_text = raw_text.strip()
-
-        try:
-            parsed = _best_effort_json_parse(raw_text)
-            token_usage = TokenUsage(
-                total_tokens=total_tokens,
-                input_tokens=input_tokens,
-                output_tokens=output_tokens,
-            )
-            return parsed, token_usage
-        except Exception as e:
-            last_error = f"JSON parse error: {e} | raw_head={raw_text[:200]!r}"
-            # loop and retry
-
-    # all attempts failed
-    raise HTTPException(
-        status_code=500,
-        detail=f"Model failed to return valid JSON after retries: {last_error}",
+    token_usage = TokenUsage(
+        total_tokens=total_tokens,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
     )
+
+    raw_text = response.output_text or ""
+    raw_text = raw_text.strip()
+
+    # First, strip markdown fences if present
+    cleaned_text = _strip_markdown_fences(raw_text)
+
+    # Try to parse directly
+    try:
+        parsed = json.loads(cleaned_text)
+    except json.JSONDecodeError:
+        # Fallback: find the largest {...} region
+        first = cleaned_text.find("{")
+        last = cleaned_text.rfind("}")
+        if first != -1 and last != -1 and last > first:
+            json_str = cleaned_text[first:last + 1].strip()
+            # As a small guard: if it ends with a trailing comma, drop it
+            if json_str.endswith(","):
+                json_str = json_str[:-1].rstrip()
+            try:
+                parsed = json.loads(json_str)
+            except Exception:
+                logger.error(
+                    "[JSON_PARSE_ERROR] page=%s text_start=%r",
+                    page_no,
+                    cleaned_text[:200],
+                )
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Model response is not valid JSON: {raw_text[:200]}",
+                )
+        else:
+            logger.error(
+                "[JSON_NO_BRACES] page=%s text_start=%r",
+                page_no,
+                cleaned_text[:200],
+            )
+            raise HTTPException(
+                status_code=500,
+                detail=f"Model response is not valid JSON: {raw_text[:200]}",
+            )
+
+    return parsed, token_usage
 
 
 # ============================================================
@@ -493,7 +642,9 @@ Remember:
 # ============================================================
 
 def _coerce_number(x: Any) -> float:
-    """Coerce messy numeric value (None, '', '—', etc.) to float."""
+    """
+    Coerce a potentially messy numeric value (None, "", "—", etc.) to float.
+    """
     if x is None:
         return 0.0
     if isinstance(x, (int, float)):
@@ -510,69 +661,11 @@ def _coerce_number(x: Any) -> float:
     return 0.0
 
 
-_TOTAL_PHRASES = [
-    "sub total",
-    "subtotal",
-    "grand total",
-    "net amount",
-    "net amt",
-    "net payable",
-    "net pay",
-    "total amount",
-    "total bill",
-    "total charges",
-    "total payable",
-    "total rs",
-    "round off",
-    "round-off",
-    "discount",
-    "concession",
-    "gst",
-    "cgst",
-    "sgst",
-    "igst",
-    "tax",
-]
-
-
-def _looks_like_pure_total_row(name: str) -> bool:
-    """
-    Decide if a row is a pure total / summary row that should be removed.
-    We are careful to NOT drop genuine tests like 'Total Protein'.
-    """
-    lower = name.lower().strip()
-
-    # If it's just 'total', 'grand total', etc.
-    if lower in {
-        "total",
-        "grand total",
-        "sub total",
-        "subtotal",
-        "total amount",
-        "net amount",
-        "net amount payable",
-        "total bill",
-        "total charges",
-    }:
-        return True
-
-    # If it contains strong multi-word total phrases
-    for phrase in _TOTAL_PHRASES:
-        if phrase in lower:
-            # But ignore common clinical test patterns
-            if "protein" in lower or "bilirubin" in lower:
-                continue
-            return True
-
-    return False
-
-
 def clean_page_dict(page_dict: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Clean raw JSON from model so Pydantic parsing won't fail.
-    - Coerce numeric fields.
-    - Remove within-page duplicate rows.
-    - Drop obvious summary/total rows.
+    Pre-clean the raw JSON dict from the model so that Pydantic parsing will not
+    fail when numeric fields are null/empty/etc.
+    Also performs within-page exact duplicate removal at dictionary level.
     """
     bill_items = page_dict.get("bill_items", []) or []
     cleaned_items: List[Dict[str, Any]] = []
@@ -584,17 +677,11 @@ def clean_page_dict(page_dict: Dict[str, Any]) -> Dict[str, Any]:
             continue
 
         name = str(item.get("item_name", "")).strip()
-        if not name:
-            continue
-
-        # Drop obvious totals / summaries
-        if _looks_like_pure_total_row(name):
-            continue
-
         amount = _coerce_number(item.get("item_amount"))
         rate = _coerce_number(item.get("item_rate"))
         qty = _coerce_number(item.get("item_quantity"))
 
+        # Exact quadruple key for dedupe (within this page)
         key = (
             name.lower(),
             round(amount, 2),
@@ -602,7 +689,7 @@ def clean_page_dict(page_dict: Dict[str, Any]) -> Dict[str, Any]:
             round(qty, 4),
         )
         if key in seen_keys:
-            # LLM hallucinated a duplicate of same row in this page
+            # LLM hallucinated a duplicate of the same row → drop it
             continue
         seen_keys.add(key)
 
@@ -615,12 +702,9 @@ def clean_page_dict(page_dict: Dict[str, Any]) -> Dict[str, Any]:
             }
         )
 
-    page_type = str(page_dict.get("page_type", "Bill Detail") or "Bill Detail")
-    page_no = str(page_dict.get("page_no", "") or "")
-
     return {
-        "page_no": page_no,
-        "page_type": page_type,
+        "page_no": str(page_dict.get("page_no", "")),
+        "page_type": str(page_dict.get("page_type", "Bill Detail")),
         "bill_items": cleaned_items,
     }
 
@@ -635,6 +719,7 @@ def reconcile_page_items(page_dict: Dict[str, Any]) -> PageItems:
     try:
         page_items = PageItems(**cleaned)
     except Exception as e:
+        logger.error(f"[SCHEMA_ERROR] page_dict={cleaned} error={e}")
         raise HTTPException(
             status_code=500,
             detail=f"Model JSON does not match expected schema: {e}",
@@ -649,6 +734,7 @@ def reconcile_page_items(page_dict: Dict[str, Any]) -> PageItems:
         if rate and qty:
             computed = rate * qty
             if math.isfinite(computed) and abs(computed - amount) > EPS:
+                # Trust arithmetic over noisy OCR when there is a big mismatch
                 item.item_amount = round(computed, 2)
         elif amount and qty and qty != 0:
             computed_rate = amount / qty
@@ -666,7 +752,10 @@ def dedupe_all_pages(pages: List[PageItems]) -> List[PageItems]:
 
     We treat items with identical:
         (page_type, normalized_name, rate, qty, amount)
-    as duplicates and keep only the first.
+    as duplicates and keep only the first occurrence.
+
+    This mainly protects against accidental double extraction of the
+    SAME scan / SAME bill, not against legitimate multiple charges.
     """
     seen: Set[Tuple[str, str, float, float, float]] = set()
     deduped_pages: List[PageItems] = []
@@ -682,6 +771,7 @@ def dedupe_all_pages(pages: List[PageItems]) -> List[PageItems]:
                 round(float(item.item_amount), 2),
             )
             if key in seen:
+                # duplicate – likely hallucination or repeated extraction
                 continue
             seen.add(key)
             new_items.append(item)
@@ -694,17 +784,10 @@ def dedupe_all_pages(pages: List[PageItems]) -> List[PageItems]:
 
 def aggregate_all_pages(pages: List[PageItems]) -> ExtractBillDataResponseData:
     """
-    Compute total_item_count.
-    Grand total is NOT part of schema, but we log it for debugging.
+    Compute total_item_count. Grand total is intentionally NOT included in
+    the schema (organizers will compute it from bill_items).
     """
     total_items = sum(len(p.bill_items) for p in pages)
-    grand_total = sum(float(it.item_amount) for p in pages for it in p.bill_items)
-
-    print(
-        f"[AGG] pages={len(pages)} total_item_count={total_items} "
-        f"grand_total={grand_total:.2f}"
-    )
-
     return ExtractBillDataResponseData(
         pagewise_line_items=pages,
         total_item_count=total_items,
@@ -712,23 +795,8 @@ def aggregate_all_pages(pages: List[PageItems]) -> ExtractBillDataResponseData:
 
 
 # ============================================================
-#  API Endpoints
+#  API Endpoint (POST)
 # ============================================================
-
-@app.get("/extract-bill-data")
-def health_check():
-    """
-    Simple health-check for evaluators that send GET.
-    Does NOT perform extraction; just tells how to use POST.
-    """
-    return {
-        "message": (
-            "Bill extraction API is healthy. "
-            "Use POST /extract-bill-data with JSON body "
-            "{\"document\": \"<public document URL>\"}."
-        )
-    }
-
 
 @app.post("/extract-bill-data", response_model=ExtractBillDataResponse)
 def extract_bill_data(req: ExtractBillDataRequest):
@@ -743,22 +811,27 @@ def extract_bill_data(req: ExtractBillDataRequest):
     Response (SUCCESS, 200):
         {
           "is_success": true,
-          "token_usage": { ... },
+          "token_usage": {
+            "total_tokens": int,
+            "input_tokens": int,
+            "output_tokens": int
+          },
           "data": {
             "pagewise_line_items": [...],
             "total_item_count": int
           }
         }
     """
+    start_time = time.time()
     url_str = str(req.document)
-    print(f"[REQ] document={url_str}")
 
-    # 1. Download
+    # 1. Download document
     content = download_document(url_str)
 
-    # 2. Split into per-page infos
+    # 2. Convert to per-page infos (image + data_url + OCR)
     page_infos = document_to_page_infos(url_str, content)
     if not page_infos:
+        logger.warning(f"[NO_PAGES] url={url_str}")
         return ExtractBillDataResponse(
             is_success=False,
             message="No pages/images could be extracted from the document.",
@@ -769,17 +842,18 @@ def extract_bill_data(req: ExtractBillDataRequest):
     input_tokens = 0
     output_tokens = 0
 
+    # 3. Run Groq Vision model on each NON-blank page
     logical_page_no = 1
-
-    # 3. Process each non-blank page
     for info in page_infos:
+        # VERY conservative: almost everything is treated as non-blank
         if info.get("is_blank"):
-            print(f"[PAGE {logical_page_no}] skipped as blank")
+            # Skip only pages that are clearly blank
+            logger.info(f"[BLANK_PAGE_SKIPPED] url={url_str} page={logical_page_no}")
             logical_page_no += 1
             continue
 
         data_url = info["data_url"]
-        ocr_text = info.get("ocr_text", "") or ""
+        ocr_text = info.get("ocr_text", "")
 
         parsed_json, usage = call_groq_for_page(
             page_no=logical_page_no,
@@ -788,6 +862,7 @@ def extract_bill_data(req: ExtractBillDataRequest):
         )
 
         page_items = reconcile_page_items(parsed_json)
+        # Ensure page_no is consistent with our logical numbering
         page_items.page_no = str(logical_page_no)
         all_pages.append(page_items)
 
@@ -795,26 +870,40 @@ def extract_bill_data(req: ExtractBillDataRequest):
         input_tokens += usage.input_tokens
         output_tokens += usage.output_tokens
 
-        print(
-            f"[PAGE {logical_page_no}] type={page_items.page_type} "
-            f"items={len(page_items.bill_items)} "
-            f"tokens(total/in/out)={usage.total_tokens}/"
-            f"{usage.input_tokens}/{usage.output_tokens}"
-        )
-
         logical_page_no += 1
 
     if not all_pages:
+        logger.warning(f"[ALL_BLANK] url={url_str}")
         return ExtractBillDataResponse(
             is_success=False,
             message="All pages were detected as blank; nothing to extract.",
         )
 
-    # 4. Cross-page dedupe
+    # 4. De-duplicate obviously repeated items across pages
     all_pages = dedupe_all_pages(all_pages)
 
     # 5. Aggregate
     data = aggregate_all_pages(all_pages)
+
+    # 6. Compute AI total for logging (NOT returned in schema)
+    ai_total = 0.0
+    for p in all_pages:
+        for item in p.bill_items:
+            ai_total += float(item.item_amount)
+
+    duration = time.time() - start_time
+    logger.info(
+        "[BILL_STATS] url=%s pages=%d items=%d ai_total=%.2f "
+        "tokens_total=%d tokens_in=%d tokens_out=%d duration_sec=%.2f",
+        url_str,
+        len(all_pages),
+        data.total_item_count,
+        ai_total,
+        total_tokens,
+        input_tokens,
+        output_tokens,
+        duration,
+    )
 
     token_usage = TokenUsage(
         total_tokens=total_tokens,
