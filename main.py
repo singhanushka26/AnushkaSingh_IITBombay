@@ -5,6 +5,7 @@ import json
 import math
 import mimetypes
 import os
+import time
 import logging
 from typing import List, Optional, Tuple, Any, Dict, Set
 
@@ -16,12 +17,10 @@ from PIL import Image, ImageStat
 from openai import OpenAI
 
 # ============================================================
-#  Logging Setup (shows up in Railway logs)
+#  Logging (for Railway logs)
 # ============================================================
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("bill-extractor")
-
+logger = logging.getLogger("uvicorn.error")
 
 # ============================================================
 #  Groq Client (OpenAI-compatible)
@@ -39,8 +38,8 @@ GROQ_VISION_MODEL_ID = os.environ.get(
     "meta-llama/llama-4-maverick-17b-128e-instruct",
 )
 
-# Hard accuracy mode flag (not heavily used, but kept for clarity)
-HARD_ACCURACY_MODE = True
+# Hard accuracy mode flag (kept for future tuning if needed)
+HARD_ACCURACY_MODE = True  # keep True for Datathon
 
 
 # ============================================================
@@ -99,6 +98,25 @@ app = FastAPI(
 
 
 # ============================================================
+#  Health Check (GET) – returns 200 OK
+# ============================================================
+
+@app.get("/extract-bill-data")
+def health_check():
+    """
+    Simple health check for evaluators / monitoring.
+    Does NOT perform any extraction – just tells clients how to use the API.
+    """
+    return {
+        "status": "alive",
+        "message": (
+            "Use POST /extract-bill-data with JSON body: "
+            '{"document": "<public URL to image or PDF>"}'
+        ),
+    }
+
+
+# ============================================================
 #  Helpers – Download & Convert Documents
 # ============================================================
 
@@ -110,13 +128,12 @@ def download_document(url: str) -> bytes:
     - Direct PDF URLs
     - Public file links that resolve to the above
     """
-    logger.info(f"[DOWNLOAD] Fetching document from URL={url}")
     try:
         resp = requests.get(url, timeout=40)
         resp.raise_for_status()
         return resp.content
     except Exception as e:
-        logger.error(f"[DOWNLOAD] Failed to download document: {e}")
+        logger.error(f"[DOWNLOAD_ERROR] url={url} error={e}")
         raise HTTPException(
             status_code=400,
             detail=f"Failed to download document: {e}",
@@ -137,13 +154,29 @@ def guess_mime_type(url: str, content: bytes) -> str:
     return "application/octet-stream"
 
 
-def image_to_data_url(img: Image.Image, quality: int = 85) -> str:
+def _resize_for_vision(img: Image.Image, max_dim: int = 1600) -> Image.Image:
+    """
+    Light downscale to reduce tokens & latency while keeping details.
+    Keeps aspect ratio. Only downsizes if larger than max_dim.
+    """
+    w, h = img.size
+    scale = max(w, h) / float(max_dim)
+    if scale <= 1.0:
+        return img
+    new_w = int(w / scale)
+    new_h = int(h / scale)
+    return img.resize((new_w, new_h), Image.LANCZOS)
+
+
+def image_to_data_url(img: Image.Image, quality: int = 80) -> str:
     """
     Convert a PIL Image into a base64 JPEG data URL.
 
-    NOTE (Option B): No resizing for maximum accuracy.
-    Only adaptive JPEG compression to stay under Groq's ~4MB limit.
+    Groq limits base64 images to ~4MB – adaptively reduce JPEG quality.
     """
+    # Optional resize for speed/token control
+    img = _resize_for_vision(img, max_dim=1600)
+
     buf = io.BytesIO()
     img.save(buf, format="JPEG", quality=quality)
     b = buf.getvalue()
@@ -170,14 +203,12 @@ def extract_ocr_text(img: Image.Image) -> str:
     try:
         import pytesseract
     except Exception:
-        logger.warning("[OCR] pytesseract not available; skipping OCR.")
         return ""
 
     try:
         text = pytesseract.image_to_string(img)
         return text or ""
-    except Exception as e:
-        logger.error(f"[OCR] Error running Tesseract: {e}")
+    except Exception:
         return ""
 
 
@@ -222,7 +253,6 @@ def document_to_page_infos(url: str, content: bytes) -> List[Dict[str, Any]]:
     - If PDF: one image per page.
     """
     mime = guess_mime_type(url, content)
-    logger.info(f"[DOC] Detected MIME type: {mime}")
     page_infos: List[Dict[str, Any]] = []
 
     # Single images
@@ -230,22 +260,20 @@ def document_to_page_infos(url: str, content: bytes) -> List[Dict[str, Any]]:
         try:
             img = Image.open(io.BytesIO(content)).convert("RGB")
         except Exception as e:
-            logger.error(f"[DOC] Unable to open image: {e}")
             raise HTTPException(
                 status_code=400,
                 detail=f"Unable to open image document: {e}",
             )
 
         ocr_text = extract_ocr_text(img)
-        info = {
-            "pil_image": img,
-            "data_url": image_to_data_url(img),
-            "ocr_text": ocr_text,
-            "is_blank": is_mostly_blank(img, ocr_text),
-        }
-        page_infos.append(info)
-        logger.info(
-            f"[DOC] Single-image document → 1 page | blank={info['is_blank']}"
+        page_infos.append(
+            {
+                "pil_image": img,
+                "data_url": image_to_data_url(img),
+                "ocr_text": ocr_text,
+                # VERY conservative: we do not treat pages as blank lightly
+                "is_blank": is_mostly_blank(img, ocr_text),
+            }
         )
         return page_infos
 
@@ -254,7 +282,6 @@ def document_to_page_infos(url: str, content: bytes) -> List[Dict[str, Any]]:
         try:
             pages = convert_from_bytes(content)
         except Exception as e:
-            logger.error(f"[DOC] PDF conversion failed: {e}")
             raise HTTPException(
                 status_code=400,
                 detail=(
@@ -264,20 +291,16 @@ def document_to_page_infos(url: str, content: bytes) -> List[Dict[str, Any]]:
                 ),
             )
 
-        logger.info(f"[DOC] PDF has {len(pages)} page(s).")
-        for idx, p in enumerate(pages, start=1):
+        for p in pages:
             img = p.convert("RGB")
             ocr_text = extract_ocr_text(img)
-            info = {
-                "pil_image": img,
-                "data_url": image_to_data_url(img),
-                "ocr_text": ocr_text,
-                "is_blank": is_mostly_blank(img, ocr_text),
-            }
-            page_infos.append(info)
-            logger.info(
-                f"[DOC] Page {idx}: blank={info['is_blank']} "
-                f"| OCR length={len(info['ocr_text'] or '')}"
+            page_infos.append(
+                {
+                    "pil_image": img,
+                    "data_url": image_to_data_url(img),
+                    "ocr_text": ocr_text,
+                    "is_blank": is_mostly_blank(img, ocr_text),
+                }
             )
         return page_infos
 
@@ -285,81 +308,21 @@ def document_to_page_infos(url: str, content: bytes) -> List[Dict[str, Any]]:
     try:
         img = Image.open(io.BytesIO(content)).convert("RGB")
     except Exception:
-        logger.error(f"[DOC] Unsupported document type: {mime}")
         raise HTTPException(
             status_code=400,
             detail=f"Unsupported document type: {mime}",
         )
 
     ocr_text = extract_ocr_text(img)
-    info = {
-        "pil_image": img,
-        "data_url": image_to_data_url(img),
-        "ocr_text": ocr_text,
-        "is_blank": is_mostly_blank(img, ocr_text),
-    }
-    page_infos.append(info)
-    logger.info(
-        f"[DOC] Fallback image mode → 1 page | blank={info['is_blank']}"
+    page_infos.append(
+        {
+            "pil_image": img,
+            "data_url": image_to_data_url(img),
+            "ocr_text": ocr_text,
+            "is_blank": is_mostly_blank(img, ocr_text),
+        }
     )
     return page_infos
-
-
-# ============================================================
-#  OCR-based "Total" Candidate Extraction (for logging)
-# ============================================================
-
-def extract_total_candidates_from_ocr(ocr_text: str) -> List[float]:
-    """
-    Very simple heuristic:
-    - Look for lines containing "total", "net amount", "grand total", etc.
-    - Extract numeric values from those lines.
-    - Used ONLY for logging / debugging accuracy; NOT used in output.
-    """
-    if not ocr_text:
-        return []
-
-    keywords = [
-        "grand total",
-        "net amount",
-        "net amt",
-        "total amount",
-        "amount payable",
-        "final total",
-        "bill total",
-        "total",
-    ]
-
-    totals: List[float] = []
-    for raw_line in ocr_text.splitlines():
-        line = raw_line.strip().lower()
-        if not line:
-            continue
-        if not any(k in line for k in keywords):
-            continue
-
-        # Extract numbers like 12345.67 or 12,345.00
-        nums = []
-        current = ""
-        for ch in raw_line:
-            if ch.isdigit() or ch in {".", ","}:
-                current += ch
-            else:
-                if current:
-                    nums.append(current)
-                    current = ""
-        if current:
-            nums.append(current)
-
-        for n in nums:
-            try:
-                val = float(n.replace(",", ""))
-                if val > 0:
-                    totals.append(val)
-            except Exception:
-                continue
-
-    return totals
 
 
 # ============================================================
@@ -404,7 +367,7 @@ Typical structure:
 
 Definitions (VERY IMPORTANT):
 - A "LINE ITEM" is one logical row describing a single charge, such as:
-    - A concrete test/procedure: "RENAL FUNCTION TEST (RFT)", "ELECTROLYTES"
+    - A CONCRETE test/procedure: "RENAL FUNCTION TEST (RFT)", "ELECTROLYTES"
     - A bed charge: "Room Ward Charges", "ICU Bed Charges"
     - A consultation: "IP CONSULTATION CHARGES (Dr. ...)"
     - A pharmacy item: a medicine or drug name with qty, rate, and amount.
@@ -506,12 +469,40 @@ You MUST output STRICT JSON (no markdown, no backticks) with this exact shape:
 }
 
 Restrictions:
-- Do NOT wrap the JSON in ``` marks.
+- Do NOT wrap the JSON in ``` marks or any markdown.
+- Do NOT prefix with 'json' or any language tag.
 - Do NOT add extra keys at any level.
 - Do NOT output totals, sub-totals, or tax rows as bill_items.
 - Do NOT output the same (name, quantity, rate, amount) row multiple times
   unless they clearly correspond to separate visible rows in the table.
 """
+
+
+def _strip_markdown_fences(raw_text: str) -> str:
+    """
+    Remove leading/trailing ``` or ```json fences if the model
+    ignored instructions and wrapped the JSON in markdown.
+    """
+    text = raw_text.strip()
+
+    # Remove starting ``` or ```json or ``` json
+    if text.startswith("```"):
+        # Drop first line (``` or ```json)
+        parts = text.splitlines()
+        # Remove first line
+        if len(parts) > 1:
+            parts = parts[1:]
+        text = "\n".join(parts).strip()
+
+    # Remove trailing ``` if present
+    if text.endswith("```"):
+        text = text[:-3].strip()
+
+    # Sometimes models start with 'json' or 'JSON' after fences
+    if text.lower().startswith("json"):
+        text = text[4:].lstrip()
+
+    return text
 
 
 def call_groq_for_page(
@@ -525,7 +516,7 @@ def call_groq_for_page(
 
     # Truncate OCR text to keep prompt size reasonable & fast
     ocr_text_snippet = (ocr_text or "").strip()
-    if len(ocr_text_snippet) > 1200:  # shorter → faster, cheaper
+    if len(ocr_text_snippet) > 1200:  # shorter than before → faster, cheaper
         ocr_text_snippet = ocr_text_snippet[:1200]
 
     user_text = f"""
@@ -552,7 +543,6 @@ Remember:
 - Do NOT double-count the same line item.
 """
 
-    logger.info(f"[LLM] Calling Groq for page {page_no} | model={GROQ_VISION_MODEL_ID}")
     try:
         response = client.responses.create(
             model=GROQ_VISION_MODEL_ID,
@@ -583,7 +573,7 @@ Remember:
             ],
         )
     except Exception as e:
-        logger.error(f"[LLM] Groq API error on page {page_no}: {e}")
+        logger.error(f"[GROQ_ERROR] page={page_no} error={e}")
         raise HTTPException(
             status_code=503,
             detail=f"Groq API error: {e}",
@@ -603,26 +593,31 @@ Remember:
         output_tokens=output_tokens,
     )
 
-    logger.info(
-        f"[LLM] Page {page_no} tokens | total={total_tokens} "
-        f"| input={input_tokens} | output={output_tokens}"
-    )
+    raw_text = response.output_text or ""
+    raw_text = raw_text.strip()
 
-    raw_text = response.output_text.strip()
+    # First, strip markdown fences if present
+    cleaned_text = _strip_markdown_fences(raw_text)
 
-    # Robust JSON parsing
+    # Try to parse directly
     try:
-        parsed = json.loads(raw_text)
+        parsed = json.loads(cleaned_text)
     except json.JSONDecodeError:
-        first = raw_text.find("{")
-        last = raw_text.rfind("}")
+        # Fallback: find the largest {...} region
+        first = cleaned_text.find("{")
+        last = cleaned_text.rfind("}")
         if first != -1 and last != -1 and last > first:
-            json_str = raw_text[first:last + 1]
+            json_str = cleaned_text[first:last + 1].strip()
+            # As a small guard: if it ends with a trailing comma, drop it
+            if json_str.endswith(","):
+                json_str = json_str[:-1].rstrip()
             try:
                 parsed = json.loads(json_str)
-            except Exception as e:
+            except Exception:
                 logger.error(
-                    f"[LLM] JSON parse failed for page {page_no}: {e} | snippet={raw_text[:200]}"
+                    "[JSON_PARSE_ERROR] page=%s text_start=%r",
+                    page_no,
+                    cleaned_text[:200],
                 )
                 raise HTTPException(
                     status_code=500,
@@ -630,7 +625,9 @@ Remember:
                 )
         else:
             logger.error(
-                f"[LLM] JSON boundaries not found for page {page_no} | snippet={raw_text[:200]}"
+                "[JSON_NO_BRACES] page=%s text_start=%r",
+                page_no,
+                cleaned_text[:200],
             )
             raise HTTPException(
                 status_code=500,
@@ -674,7 +671,6 @@ def clean_page_dict(page_dict: Dict[str, Any]) -> Dict[str, Any]:
     cleaned_items: List[Dict[str, Any]] = []
 
     seen_keys: Set[Tuple[str, float, float, float]] = set()
-    dropped_dups = 0
 
     for item in bill_items:
         if not isinstance(item, dict):
@@ -694,7 +690,6 @@ def clean_page_dict(page_dict: Dict[str, Any]) -> Dict[str, Any]:
         )
         if key in seen_keys:
             # LLM hallucinated a duplicate of the same row → drop it
-            dropped_dups += 1
             continue
         seen_keys.add(key)
 
@@ -706,11 +701,6 @@ def clean_page_dict(page_dict: Dict[str, Any]) -> Dict[str, Any]:
                 "item_quantity": qty,
             }
         )
-
-    logger.info(
-        f"[CLEAN] Raw items={len(bill_items)} | kept={len(cleaned_items)} | "
-        f"dropped_within_page_dups={dropped_dups}"
-    )
 
     return {
         "page_no": str(page_dict.get("page_no", "")),
@@ -729,7 +719,7 @@ def reconcile_page_items(page_dict: Dict[str, Any]) -> PageItems:
     try:
         page_items = PageItems(**cleaned)
     except Exception as e:
-        logger.error(f"[RECONCILE] Schema mismatch for page {cleaned.get('page_no', '?')}: {e}")
+        logger.error(f"[SCHEMA_ERROR] page_dict={cleaned} error={e}")
         raise HTTPException(
             status_code=500,
             detail=f"Model JSON does not match expected schema: {e}",
@@ -744,7 +734,7 @@ def reconcile_page_items(page_dict: Dict[str, Any]) -> PageItems:
         if rate and qty:
             computed = rate * qty
             if math.isfinite(computed) and abs(computed - amount) > EPS:
-                # Trust arithmetic over noisy OCR when there is a mismatch
+                # Trust arithmetic over noisy OCR when there is a big mismatch
                 item.item_amount = round(computed, 2)
         elif amount and qty and qty != 0:
             computed_rate = amount / qty
@@ -769,7 +759,6 @@ def dedupe_all_pages(pages: List[PageItems]) -> List[PageItems]:
     """
     seen: Set[Tuple[str, str, float, float, float]] = set()
     deduped_pages: List[PageItems] = []
-    dropped_cross_dups = 0
 
     for p in pages:
         new_items: List[BillItem] = []
@@ -783,7 +772,6 @@ def dedupe_all_pages(pages: List[PageItems]) -> List[PageItems]:
             )
             if key in seen:
                 # duplicate – likely hallucination or repeated extraction
-                dropped_cross_dups += 1
                 continue
             seen.add(key)
             new_items.append(item)
@@ -791,7 +779,6 @@ def dedupe_all_pages(pages: List[PageItems]) -> List[PageItems]:
         p.bill_items = new_items
         deduped_pages.append(p)
 
-    logger.info(f"[DEDUPE] Dropped cross-page duplicates={dropped_cross_dups}")
     return deduped_pages
 
 
@@ -808,26 +795,7 @@ def aggregate_all_pages(pages: List[PageItems]) -> ExtractBillDataResponseData:
 
 
 # ============================================================
-#  Health Check / Info Endpoint (fixes GET 405)
-# ============================================================
-
-@app.get("/extract-bill-data")
-def health_check():
-    """
-    Simple GET endpoint so external systems doing a GET health check
-    on /extract-bill-data do NOT receive 405 Method Not Allowed.
-
-    IMPORTANT: Actual extraction must use POST /extract-bill-data.
-    """
-    return {
-        "status": "ok",
-        "message": "Use POST /extract-bill-data with JSON body {'document': '<url>'} for bill extraction.",
-        "expected_method": "POST",
-    }
-
-
-# ============================================================
-#  Main API Endpoint (POST)
+#  API Endpoint (POST)
 # ============================================================
 
 @app.post("/extract-bill-data", response_model=ExtractBillDataResponse)
@@ -854,8 +822,8 @@ def extract_bill_data(req: ExtractBillDataRequest):
           }
         }
     """
+    start_time = time.time()
     url_str = str(req.document)
-    logger.info(f"[API] Received /extract-bill-data request | document={url_str}")
 
     # 1. Download document
     content = download_document(url_str)
@@ -863,7 +831,7 @@ def extract_bill_data(req: ExtractBillDataRequest):
     # 2. Convert to per-page infos (image + data_url + OCR)
     page_infos = document_to_page_infos(url_str, content)
     if not page_infos:
-        logger.warning("[API] No pages/images could be extracted.")
+        logger.warning(f"[NO_PAGES] url={url_str}")
         return ExtractBillDataResponse(
             is_success=False,
             message="No pages/images could be extracted from the document.",
@@ -874,28 +842,18 @@ def extract_bill_data(req: ExtractBillDataRequest):
     input_tokens = 0
     output_tokens = 0
 
-    # For logging: OCR-based total candidates per page
-    ocr_final_total_candidates: Dict[int, List[float]] = {}
-
     # 3. Run Groq Vision model on each NON-blank page
     logical_page_no = 1
     for info in page_infos:
         # VERY conservative: almost everything is treated as non-blank
         if info.get("is_blank"):
-            logger.info(f"[API] Skipping page {logical_page_no} (detected as blank).")
+            # Skip only pages that are clearly blank
+            logger.info(f"[BLANK_PAGE_SKIPPED] url={url_str} page={logical_page_no}")
             logical_page_no += 1
             continue
 
         data_url = info["data_url"]
         ocr_text = info.get("ocr_text", "")
-
-        # For logging: extract OCR-based "total" candidates
-        candidates = extract_total_candidates_from_ocr(ocr_text)
-        ocr_final_total_candidates[logical_page_no] = candidates
-        if candidates:
-            logger.info(
-                f"[OCR-TOTAL] Page {logical_page_no} total candidates from OCR: {candidates}"
-            )
 
         parsed_json, usage = call_groq_for_page(
             page_no=logical_page_no,
@@ -908,13 +866,6 @@ def extract_bill_data(req: ExtractBillDataRequest):
         page_items.page_no = str(logical_page_no)
         all_pages.append(page_items)
 
-        # Page-level AI total for logging
-        page_sum = sum(float(it.item_amount) for it in page_items.bill_items)
-        logger.info(
-            f"[PAGE_SUM] Page {logical_page_no} | type={page_items.page_type} | "
-            f"items={len(page_items.bill_items)} | AI_page_total={page_sum:.2f}"
-        )
-
         total_tokens += usage.total_tokens
         input_tokens += usage.input_tokens
         output_tokens += usage.output_tokens
@@ -922,7 +873,7 @@ def extract_bill_data(req: ExtractBillDataRequest):
         logical_page_no += 1
 
     if not all_pages:
-        logger.warning("[API] All pages detected as blank; nothing to extract.")
+        logger.warning(f"[ALL_BLANK] url={url_str}")
         return ExtractBillDataResponse(
             is_success=False,
             message="All pages were detected as blank; nothing to extract.",
@@ -934,18 +885,24 @@ def extract_bill_data(req: ExtractBillDataRequest):
     # 5. Aggregate
     data = aggregate_all_pages(all_pages)
 
-    # 6. Compute AI grand total for logging (NOT part of schema)
-    ai_grand_total = 0.0
+    # 6. Compute AI total for logging (NOT returned in schema)
+    ai_total = 0.0
     for p in all_pages:
-        for it in p.bill_items:
-            ai_grand_total += float(it.item_amount)
+        for item in p.bill_items:
+            ai_total += float(item.item_amount)
 
+    duration = time.time() - start_time
     logger.info(
-        f"[DOC SUMMARY] URL={url_str} | pages_used={len(all_pages)} | "
-        f"total_items={data.total_item_count} | AI_grand_total={ai_grand_total:.2f}"
-    )
-    logger.info(
-        f"[TOKENS] total={total_tokens} | input={input_tokens} | output={output_tokens}"
+        "[BILL_STATS] url=%s pages=%d items=%d ai_total=%.2f "
+        "tokens_total=%d tokens_in=%d tokens_out=%d duration_sec=%.2f",
+        url_str,
+        len(all_pages),
+        data.total_item_count,
+        ai_total,
+        total_tokens,
+        input_tokens,
+        output_tokens,
+        duration,
     )
 
     token_usage = TokenUsage(
