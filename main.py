@@ -162,17 +162,7 @@ def extract_ocr_text(img: Image.Image) -> str:
 
 
 def is_mostly_blank(img: Image.Image, ocr_text: str) -> bool:
-    """
-    Heuristic: detect near-blank pages so we don't send separators/blank scans.
-
-    Criteria:
-    - Very bright (mean grayscale > 245)
-    - AND OCR text length < 30 characters
-    """
-    gray = img.convert("L")
-    stat = ImageStat.Stat(gray)
-    mean = stat.mean[0] if stat.mean else 255.0
-    return bool(mean > 245 and len(ocr_text.strip()) < 30)
+    return False
 
 
 def document_to_page_infos(url: str, content: bytes) -> List[Dict[str, Any]]:
