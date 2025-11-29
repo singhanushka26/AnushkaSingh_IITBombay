@@ -1,21 +1,20 @@
 fastapi
 uvicorn[standard]
-requests
-pdf2image
-Pillow
-openai>=1.40.0  # for Responses API client with base_url support
+
+pydantic
+httpx
 python-multipart
 
+Pillow
+numpy
+pdf2image
 
-
-
-httpx
-pydantic
-
-paddlepaddle
-paddleocr
 pytesseract
 
-opencv-python
-numpy
+openai>=1.35.7
 
+# For typing + safety
+typing-extensions
+
+# To run tesseract inside container
+pytz
