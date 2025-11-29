@@ -25,10 +25,16 @@ client = OpenAI(
     base_url="https://api.groq.com/openai/v1",
 )
 
-# Fast + good accuracy
-GROQ_VISION_MODEL_ID = os.environ.get(
-    "GROQ_VISION_MODEL_ID",
+# Fast model for bulk extraction
+GROQ_VISION_MODEL_SCOUT = os.environ.get(
+    "GROQ_VISION_MODEL_SCOUT",
     "meta-llama/llama-4-scout-17b-16e-instruct",
+)
+
+# More accurate model for refinement
+GROQ_VISION_MODEL_MAVERICK = os.environ.get(
+    "GROQ_VISION_MODEL_MAVERICK",
+    "meta-llama/llama-4-maverick-17b-128e-instruct",
 )
 
 # Groq Vision limit: MAX 5 images per request
@@ -80,10 +86,11 @@ class ExtractBillDataResponse(BaseModel):
 
 app = FastAPI(
     title="Bajaj Datathon Bill Extraction API",
-    version="6.0.0",
+    version="7.0.0",
     description=(
         "Extracts line items from multi-page bill/invoice documents using "
         "Groq vision models with batching (max 5 images per request). "
+        "Scout does bulk extraction; Maverick refines suspicious pages. "
         "Implements the exact HackRx Datathon schema and is tuned for "
         "high accuracy while staying under time limits on large PDFs."
     ),
@@ -240,10 +247,10 @@ def document_to_page_infos(url: str, content: bytes) -> List[Dict[str, Any]]:
 
 
 # ============================================================
-#  LLM Prompt – batched, strict JSON, handle repeated rows
+#  LLM Prompts – Scout (batch) + Maverick (single page)
 # ============================================================
 
-SYSTEM_PROMPT = """
+SYSTEM_PROMPT_SCOUT = """
 You are an expert medical BILL ITEM extraction engine for hospital bills.
 
 Your goals:
@@ -280,9 +287,6 @@ same description show clear numbers, use that pattern:
         quantity = q0
         rate     = a0 / q0 (or r0)
         amount   = quantity * rate
-
-This means you may RECONSTRUCT missing amounts using the pattern of
-other rows with the same description (e.g. repeated consultation charges).
 
 If a numeric field is still unknown after this reasoning, set it to 0.0.
 
@@ -322,6 +326,48 @@ STRICT REQUIREMENTS:
 - JSON ONLY. No ```json, no headings, no commentary.
 - No extra keys at top level or inside any object.
 - Do NOT output totals, sub-totals, taxes, or summary-only rows as bill_items.
+"""
+
+# Shorter, single-page focused prompt for Maverick
+SYSTEM_PROMPT_MAVERICK = """
+You are a precise hospital BILL ITEM extraction engine.
+
+You will see ONLY ONE page image of a hospital bill.
+
+Your task:
+
+- Read all charge tables on this page.
+- For EVERY visible row that represents a real charge (with description + amount),
+  output ONE bill_items entry.
+- DO NOT output totals, sub-totals, or purely summary/tax rows.
+- Do NOT add any commentary. Return JSON ONLY.
+
+Output format for this SINGLE PAGE:
+
+{
+  "pagewise_line_items": [
+    {
+      "page_no": "1",
+      "page_type": "Bill Detail" | "Final Bill" | "Pharmacy",
+      "bill_items": [
+        {
+          "item_name": "<string>",
+          "item_amount": <float>,
+          "item_rate": <float>,
+          "item_quantity": <float>
+        }
+      ]
+    }
+  ],
+  "total_item_count": <integer>
+}
+
+Rules:
+- JSON only (no markdown, no comments).
+- Numeric fields must be numbers, not strings.
+- If quantity is missing but amount is visible: quantity=1.0, rate=amount.
+- If rate is missing but quantity & amount are visible: rate=amount/quantity.
+- If a numeric field is unreadable: set 0.0.
 """
 
 
@@ -370,11 +416,11 @@ For EACH batch page i (1-based), you must:
 
     try:
         response = client.responses.create(
-            model=GROQ_VISION_MODEL_ID,
+            model=GROQ_VISION_MODEL_SCOUT,
             input=[
                 {
                     "role": "system",
-                    "content": [{"type": "input_text", "text": SYSTEM_PROMPT.strip()}],
+                    "content": [{"type": "input_text", "text": SYSTEM_PROMPT_SCOUT.strip()}],
                 },
                 {
                     "role": "user",
@@ -385,7 +431,7 @@ For EACH batch page i (1-based), you must:
     except Exception as e:
         raise HTTPException(
             status_code=503,
-            detail=f"Groq API error: {e}",
+            detail=f"Groq API error (Scout batch): {e}",
         )
 
     usage = getattr(response, "usage", None)
@@ -404,7 +450,7 @@ For EACH batch page i (1-based), you must:
 
     raw_text = response.output_text.strip()
 
-    # Robust JSON parsing (strip fences if any)
+    # Robust JSON parsing (same logic as your working version)
     try:
         parsed = json.loads(raw_text)
     except json.JSONDecodeError:
@@ -448,6 +494,108 @@ For EACH batch page i (1-based), you must:
 
     raw_pages = raw_pages[:num_batch_pages]
     return raw_pages, token_usage
+
+
+def call_groq_for_single_page_maverick(
+    page_info: Dict[str, Any]
+) -> Tuple[Dict[str, Any], TokenUsage]:
+    """
+    Single-page refinement using Maverick.
+    Returns:
+        - raw_page: one dict with page_no="1", page_type, bill_items
+        - token_usage: TokenUsage for this Maverick call
+
+    IMPORTANT: Any JSON/LLM error should be handled by the caller
+               (we will FALL BACK to Scout results for safety).
+    """
+    user_content: List[Dict[str, Any]] = [
+        {
+            "type": "input_text",
+            "text": "This is a single hospital bill page. Extract all charge line items only.",
+        },
+        {
+            "type": "input_image",
+            "image_url": page_info["data_url"],
+            "detail": "high",
+        },
+    ]
+
+    try:
+        response = client.responses.create(
+            model=GROQ_VISION_MODEL_MAVERICK,
+            input=[
+                {
+                    "role": "system",
+                    "content": [{"type": "input_text", "text": SYSTEM_PROMPT_MAVERICK.strip()}],
+                },
+                {
+                    "role": "user",
+                    "content": user_content,
+                },
+            ],
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Groq API error (Maverick single-page): {e}",
+        )
+
+    usage = getattr(response, "usage", None)
+    if usage is not None:
+        total_tokens = int(getattr(usage, "total_tokens", 0) or 0)
+        input_tokens = int(getattr(usage, "input_tokens", 0) or 0)
+        output_tokens = int(getattr(usage, "output_tokens", 0) or 0)
+    else:
+        total_tokens = input_tokens = output_tokens = 0
+
+    token_usage = TokenUsage(
+        total_tokens=total_tokens,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+    )
+
+    raw_text = response.output_text.strip()
+
+    # Robust JSON parsing, same pattern
+    try:
+        parsed = json.loads(raw_text)
+    except json.JSONDecodeError:
+        first = raw_text.find("{")
+        last = raw_text.rfind("}")
+        if first != -1 and last != -1 and last > first:
+            json_str = raw_text[first:last + 1]
+            try:
+                parsed = json.loads(json_str)
+            except Exception:
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Maverick response is not valid JSON: {raw_text[:200]}",
+                )
+        else:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Maverick response is not valid JSON: {raw_text[:200]}",
+            )
+
+    if isinstance(parsed, dict) and "pagewise_line_items" in parsed:
+        raw_pages = parsed.get("pagewise_line_items", []) or []
+    elif isinstance(parsed, list):
+        raw_pages = parsed
+    else:
+        raise HTTPException(
+            status_code=500,
+            detail="Maverick JSON does not contain 'pagewise_line_items' list.",
+        )
+
+    if not raw_pages:
+        raise HTTPException(
+            status_code=500,
+            detail="Maverick JSON returned empty pagewise_line_items.",
+        )
+
+    # Use first page only (this call is strictly single-page)
+    raw_page = raw_pages[0]
+    return raw_page, token_usage
 
 
 # ============================================================
@@ -544,7 +692,7 @@ def reconcile_page_items(page_dict: Dict[str, Any]) -> PageItems:
 
 def enrich_from_patterns(pages: List[PageItems]) -> List[PageItems]:
     """
-    SECOND PASS (Option B):
+    SECOND PASS:
     If some rows have missing numeric fields, but other rows with the same
     item_name have good numbers, use that pattern to fill in.
 
@@ -663,7 +811,7 @@ def extract_bill_data(req: ExtractBillDataRequest):
             message="No pages/images could be extracted from the document.",
         )
 
-    # 3. Process pages in batches of <= MAX_IMAGES_PER_REQUEST
+    # 3. Scout pass – process pages in batches of <= MAX_IMAGES_PER_REQUEST
     all_pages: List[PageItems] = []
     total_tokens = 0
     input_tokens = 0
@@ -702,10 +850,46 @@ def extract_bill_data(req: ExtractBillDataRequest):
             message="Model did not return any page items.",
         )
 
-    # 4. Enrich missing numeric fields using global patterns (Option B)
+    # 4. Maverick refinement on suspicious pages (best-effort, never crashes)
+    #    Criteria: very sparse pages (<=1 item) OR pages labeled "Final Bill"
+    suspicious_indices: List[int] = []
+    for idx, p in enumerate(all_pages):
+        if len(p.bill_items) <= 1:
+            suspicious_indices.append(idx)
+        elif p.page_type.strip().lower() == "final bill":
+            suspicious_indices.append(idx)
+
+    # Optionally cap the number of Maverick pages to keep latency low
+    MAX_MAVERICK_PAGES = 10
+    suspicious_indices = suspicious_indices[:MAX_MAVERICK_PAGES]
+
+    for idx in suspicious_indices:
+        try:
+            raw_page_mav, usage_mav = call_groq_for_single_page_maverick(
+                page_infos[idx]
+            )
+        except HTTPException as e:
+            # Log & skip; keep Scout result for this page
+            print(f"[MAVERICK_SKIP] page={idx+1} reason={e.detail}")
+            continue
+        except Exception as e:
+            print(f"[MAVERICK_SKIP] page={idx+1} unexpected_error={e}")
+            continue
+
+        # Accumulate Maverick token usage
+        total_tokens += usage_mav.total_tokens
+        input_tokens += usage_mav.input_tokens
+        output_tokens += usage_mav.output_tokens
+
+        # Map Maverick's local page_no ("1") to global page number
+        raw_page_mav["page_no"] = str(idx + 1)
+        refined_page = reconcile_page_items(raw_page_mav)
+        all_pages[idx] = refined_page
+
+    # 5. Enrich missing numeric fields using global patterns
     all_pages = enrich_from_patterns(all_pages)
 
-    # 5. Aggregate
+    # 6. Aggregate
     data = aggregate_all_pages(all_pages)
 
     token_usage = TokenUsage(
@@ -714,7 +898,7 @@ def extract_bill_data(req: ExtractBillDataRequest):
         output_tokens=output_tokens,
     )
 
-    # 6. Logging
+    # 7. Logging
     grand_total = compute_grand_total_amount(all_pages)
     elapsed = time.time() - start_time
 
