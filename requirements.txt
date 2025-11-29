@@ -2,8 +2,9 @@ fastapi
 uvicorn[standard]
 
 pydantic
-httpx
 python-multipart
+requests
+httpx
 
 Pillow
 numpy
@@ -12,9 +13,3 @@ pdf2image
 pytesseract
 
 openai>=1.35.7
-
-# For typing + safety
-typing-extensions
-
-# To run tesseract inside container
-pytz
