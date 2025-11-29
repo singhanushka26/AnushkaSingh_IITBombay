@@ -14,6 +14,14 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, HttpUrl
 from pdf2image import convert_from_bytes
 from PIL import Image, ImageEnhance
+
+try:
+    import pytesseract
+
+    HAVE_TESSERACT = True
+except ImportError:
+    HAVE_TESSERACT = False
+
 from openai import OpenAI
 
 # ============================================================
@@ -25,21 +33,30 @@ client = OpenAI(
     base_url="https://api.groq.com/openai/v1",
 )
 
-# Fast model for bulk extraction
+# MODE SELECTION (via env)
+#   PIPELINE_MODE = "speed" | "balanced" | "accuracy"
+PIPELINE_MODE = os.environ.get("PIPELINE_MODE", "balanced").lower()
+
+# Vision models
 GROQ_VISION_MODEL_SCOUT = os.environ.get(
     "GROQ_VISION_MODEL_SCOUT",
     "meta-llama/llama-4-scout-17b-16e-instruct",
 )
 
-# More accurate model for refinement
 GROQ_VISION_MODEL_MAVERICK = os.environ.get(
     "GROQ_VISION_MODEL_MAVERICK",
     "meta-llama/llama-4-maverick-17b-128e-instruct",
 )
 
-# Groq Vision limit: MAX 5 images per request (hard cap)
-GROQ_MAX_IMAGES_PER_REQUEST = 5
+# Groq Vision limit: MAX 5 images per request
+MAX_IMAGES_PER_REQUEST = 5
 
+# Global soft time budget (sec) – used to decide how aggressively to refine
+TIME_BUDGET_SEC = float(os.environ.get("TIME_BUDGET_SEC", "110"))
+
+# Cropping + OCR settings
+ENABLE_SMART_CROP = os.environ.get("ENABLE_SMART_CROP", "1") == "1"
+USE_OCR_FOR_MAVERICK = os.environ.get("USE_OCR_FOR_MAVERICK", "1") == "1" and HAVE_TESSERACT
 
 # ============================================================
 #  Pydantic Schemas – EXACT Datathon spec
@@ -88,13 +105,12 @@ app = FastAPI(
     title="Bajaj Datathon Bill Extraction API",
     version="8.0.0",
     description=(
-        "Dynamic-speed bill extraction API using Groq Scout (bulk) "
-        "+ Maverick (refinement). Automatically adjusts batch size and "
-        "refinement depth based on page count to maximize accuracy "
-        "while staying under ~120 seconds even for 20+ page PDFs."
+        "Extracts line items from multi-page hospital bills using Groq vision "
+        "models with batching (max 5 images per request). "
+        "Scout = bulk extraction, Maverick = refinement on selected pages. "
+        "Strict JSON, dynamic effort based on pages & mode (speed/balanced/accuracy)."
     ),
 )
-
 
 # ============================================================
 #  Helpers – Download & Convert Documents
@@ -123,10 +139,30 @@ def guess_mime_type(url: str, content: bytes) -> str:
     return "application/octet-stream"
 
 
-def _resize_for_vision(img: Image.Image, max_dim: int = 900) -> Image.Image:
+def _smart_crop(img: Image.Image) -> Image.Image:
+    """
+    Simple 'smart' crop to remove noisy margins and reduce tokens.
+    Keeps central area where tables usually are.
+    """
+    if not ENABLE_SMART_CROP:
+        return img
+
+    w, h = img.size
+    # Keep 94% width, 86% height roughly centered
+    left = int(w * 0.03)
+    right = int(w * 0.97)
+    top = int(h * 0.07)
+    bottom = int(h * 0.93)
+
+    if right <= left or bottom <= top:
+        return img
+    return img.crop((left, top, right, bottom))
+
+
+def _resize_for_vision(img: Image.Image, max_dim: int) -> Image.Image:
     """
     Downscale to reduce tokens & latency while keeping table details readable.
-    Slightly smaller than before for better speed on 20+ pages.
+    max_dim is mode-dependent (speed/balanced/accuracy).
     """
     w, h = img.size
     scale = max(w, h) / float(max_dim)
@@ -141,27 +177,26 @@ def _enhance_for_vision(img: Image.Image) -> Image.Image:
     """
     Light contrast + sharpness boost to help faint numeric columns.
     """
-    img = ImageEnhance.Contrast(img).enhance(1.6)
-    img = ImageEnhance.Sharpness(img).enhance(1.4)
+    img = ImageEnhance.Contrast(img).enhance(1.5)
+    img = ImageEnhance.Sharpness(img).enhance(1.3)
     return img
 
 
-def image_to_data_url(
-    img: Image.Image,
-    quality: int = 60,
-    max_dim: int = 900,
-) -> str:
+def image_to_data_url(img: Image.Image, max_dim: int) -> str:
     """
     Convert a PIL Image into a base64 JPEG data URL.
 
+    - Optional smart crop
     - Resize to max_dim
     - Slight enhancement
     - JPEG quality ~60
     - Ensure < 4 MB per image
     """
+    img = _smart_crop(img)
     img = _resize_for_vision(img, max_dim=max_dim)
     img = _enhance_for_vision(img)
 
+    quality = 60
     buf = io.BytesIO()
     img.save(buf, format="JPEG", quality=quality)
     b = buf.getvalue()
@@ -176,12 +211,7 @@ def image_to_data_url(
     return f"data:image/jpeg;base64,{b64}"
 
 
-def document_to_page_infos(
-    url: str,
-    content: bytes,
-    jpeg_quality: int = 60,
-    max_dim: int = 900,
-) -> List[Dict[str, Any]]:
+def document_to_page_infos(url: str, content: bytes, max_dim: int) -> List[Dict[str, Any]]:
     """
     Convert the downloaded document into a list of PAGE INFOS:
 
@@ -206,7 +236,7 @@ def document_to_page_infos(
         page_infos.append(
             {
                 "page_index": 0,
-                "data_url": image_to_data_url(img, quality=jpeg_quality, max_dim=max_dim),
+                "data_url": image_to_data_url(img, max_dim=max_dim),
             }
         )
         return page_infos
@@ -230,9 +260,7 @@ def document_to_page_infos(
             page_infos.append(
                 {
                     "page_index": idx,
-                    "data_url": image_to_data_url(
-                        img, quality=jpeg_quality, max_dim=max_dim
-                    ),
+                    "data_url": image_to_data_url(img, max_dim=max_dim),
                 }
             )
         return page_infos
@@ -249,57 +277,10 @@ def document_to_page_infos(
     page_infos.append(
         {
             "page_index": 0,
-            "data_url": image_to_data_url(img, quality=jpeg_quality, max_dim=max_dim),
+            "data_url": image_to_data_url(img, max_dim=max_dim),
         }
     )
     return page_infos
-
-
-# ============================================================
-#  Dynamic inference configuration
-# ============================================================
-
-def select_inference_config(num_pages: int) -> Dict[str, Any]:
-    """
-    Dynamically choose batch size and refinement depth based on num_pages.
-
-    - Accuracy mode (<= 8 pages): more Maverick, smaller batches.
-    - Balanced mode (9–15 pages): medium batches, some Maverick.
-    - Speed mode (> 15 pages): bigger batches, very limited Maverick.
-
-    This is a heuristic controller to keep total runtime under ~120s
-    while giving small documents more attention for accuracy.
-    """
-    if num_pages <= 8:
-        # Small doc -> spend more time, higher accuracy
-        return {
-            "mode": "accuracy",
-            "batch_size": 2,
-            "max_maverick_pages": 8,
-            "sparse_threshold": 3,  # pages with <=3 items → suspicious
-            "jpeg_quality": 65,
-            "max_dim": 900,
-        }
-    elif num_pages <= 15:
-        # Medium doc -> balanced
-        return {
-            "mode": "balanced",
-            "batch_size": 3,
-            "max_maverick_pages": 3,
-            "sparse_threshold": 2,
-            "jpeg_quality": 55,
-            "max_dim": 880,
-        }
-    else:
-        # Large doc -> prioritize speed & avoiding timeouts
-        return {
-            "mode": "speed",
-            "batch_size": 4,
-            "max_maverick_pages": 1,
-            "sparse_threshold": 1,
-            "jpeg_quality": 50,
-            "max_dim": 850,
-        }
 
 
 # ============================================================
@@ -311,7 +292,7 @@ You are an expert medical BILL ITEM extraction engine for hospital bills.
 
 Your goals:
 
-1) Capture EVERY genuine line item from the tables (high recall).
+1) Capture EVERY genuine line item from the tables (high recall per row).
 2) Do NOT double-count or duplicate the same line item when it is only a summary.
 3) Make the sum of all `item_amount` values across all pages as close as possible
    to the FINAL TOTAL printed in the bill.
@@ -319,18 +300,19 @@ Your goals:
 
 CRITICAL BEHAVIOUR FOR REPEATED ROWS:
 
-- If the same row appears MANY TIMES (e.g. many rows with
+- If the same row appears MANY TIMES (e.g., many rows with
   "IP CONSULTATION CHARGES  Qty 1  Rate 1000  Amount 1000")
   then you MUST output ONE BILL ITEM PER VISUAL ROW.
   Example: if 20 such rows are visible, you must output 20 bill_items
   with the same name & numbers (do NOT collapse them into one).
 
 - Section totals such as "TOTAL", "SUB TOTAL", "GRAND TOTAL",
-  "NET AMOUNT PAYABLE", etc. MUST NOT be emitted as bill_items.
+  "NET AMOUNT PAYABLE", taxes, discounts, and overall summaries
+  MUST NOT be emitted as bill_items.
 
 NUMERIC RULES:
 
-- item_quantity: read from columns like "Qty", "No. of Days", etc.
+- item_quantity: read from columns like "Qty", "No. of Days", "Units", etc.
 - item_rate:     from "Rate", "Charges per day", etc.
 - item_amount:   from "Amount", "Net Amt", etc.
 
@@ -354,7 +336,7 @@ For EACH page i in this batch (1-based):
 - Decide page_type ∈ {"Bill Detail", "Final Bill", "Pharmacy"}.
 - Extract ALL line items for that page (one per visual row).
 
-Return ONE STRICT JSON object ONLY (no markdown):
+Return ONE STRICT JSON object ONLY:
 
 {
   "pagewise_line_items": [
@@ -379,7 +361,7 @@ Return ONE STRICT JSON object ONLY (no markdown):
 - total_item_count is the number of bill_items across all pages in the batch.
 
 STRICT REQUIREMENTS:
-- JSON ONLY. No ```json, no headings, no commentary.
+- JSON ONLY. No markdown, no ``` fences, no commentary.
 - No extra keys at top level or inside any object.
 - Do NOT output totals, sub-totals, taxes, or summary-only rows as bill_items.
 """
@@ -387,14 +369,14 @@ STRICT REQUIREMENTS:
 SYSTEM_PROMPT_MAVERICK = """
 You are a precise hospital BILL ITEM extraction engine.
 
-You will see ONLY ONE page image of a hospital bill.
+You will see ONLY ONE page image of a hospital bill and (optionally) OCR text.
 
 Your task:
 
-- Read all charge tables on this page.
-- For EVERY visible row that represents a real charge (with description + amount),
+- Read all charge tables on this single page.
+- For EVERY visible row that represents a real charge (description + numeric amount),
   output ONE bill_items entry.
-- DO NOT output totals, sub-totals, or purely summary/tax rows.
+- DO NOT output totals, sub-totals, "Net amount", taxes, discounts, or summary-only rows.
 - Do NOT add any commentary. Return JSON ONLY.
 
 Output format for this SINGLE PAGE:
@@ -418,19 +400,22 @@ Output format for this SINGLE PAGE:
 }
 
 Rules:
-- JSON only (no markdown, no comments).
+- JSON only (no markdown, no fences, no comments).
 - Numeric fields must be numbers, not strings.
-- If quantity is missing but amount is visible: quantity=1.0, rate=amount.
-- If rate is missing but quantity & amount are visible: rate=amount/quantity.
-- If a numeric field is unreadable: set 0.0.
+- If quantity is missing but amount is visible: quantity = 1.0, rate = amount.
+- If rate is missing but quantity & amount are visible: rate = amount / quantity.
+- If a numeric field is unreadable: set it to 0.0.
 """
 
+# ============================================================
+#  LLM Calls – Strict JSON (response_format)
+# ============================================================
 
 def call_groq_for_batch(
     batch_page_infos: List[Dict[str, Any]],
 ) -> Tuple[List[Dict[str, Any]], TokenUsage]:
     """
-    Single Groq Vision call for a batch of pages (size <= GROQ_MAX_IMAGES_PER_REQUEST).
+    Single Groq Vision call for a batch of pages (size <= MAX_IMAGES_PER_REQUEST).
     Returns:
         - raw_pages: list of per-page dicts (page_no, page_type, bill_items)
         - token_usage: TokenUsage for this batch
@@ -444,8 +429,8 @@ The images will be provided in order for this batch:
 first image is batch page 1, second is batch page 2, ..., up to batch page {num_batch_pages}.
 
 For EACH batch page i (1-based), you must:
-- Set page_no = "<i>" (as a string)
-- Choose page_type from: "Bill Detail", "Final Bill", "Pharmacy"
+- Set page_no = "<i>" (as a string).
+- Choose page_type from: "Bill Detail", "Final Bill", "Pharmacy".
 - Extract bill_items ONLY for that page.
 """
 
@@ -472,12 +457,11 @@ For EACH batch page i (1-based), you must:
     try:
         response = client.responses.create(
             model=GROQ_VISION_MODEL_SCOUT,
+            response_format={"type": "json_object"},
             input=[
                 {
                     "role": "system",
-                    "content": [
-                        {"type": "input_text", "text": SYSTEM_PROMPT_SCOUT.strip()}
-                    ],
+                    "content": [{"type": "input_text", "text": SYSTEM_PROMPT_SCOUT.strip()}],
                 },
                 {
                     "role": "user",
@@ -507,7 +491,7 @@ For EACH batch page i (1-based), you must:
 
     raw_text = response.output_text.strip()
 
-    # Robust JSON parsing (strip any junk around the JSON)
+    # STRICT JSON: we still do a tiny safety trimming, but if it fails -> error
     try:
         parsed = json.loads(raw_text)
     except json.JSONDecodeError:
@@ -515,13 +499,7 @@ For EACH batch page i (1-based), you must:
         last = raw_text.rfind("}")
         if first != -1 and last != -1 and last > first:
             json_str = raw_text[first:last + 1]
-            try:
-                parsed = json.loads(json_str)
-            except Exception:
-                raise HTTPException(
-                    status_code=500,
-                    detail=f"Model response is not valid JSON: {raw_text[:200]}",
-                )
+            parsed = json.loads(json_str)
         else:
             raise HTTPException(
                 status_code=500,
@@ -554,38 +532,50 @@ For EACH batch page i (1-based), you must:
 
 
 def call_groq_for_single_page_maverick(
-    page_info: Dict[str, Any]
+    page_info: Dict[str, Any],
+    ocr_hint: Optional[str] = None,
 ) -> Tuple[Dict[str, Any], TokenUsage]:
     """
     Single-page refinement using Maverick.
     Returns:
         - raw_page: one dict with page_no="1", page_type, bill_items
         - token_usage: TokenUsage for this Maverick call
-
-    IMPORTANT: Any JSON/LLM error should be handled by the caller
-               (we will FALL BACK to Scout results for safety).
     """
-    user_content: List[Dict[str, Any]] = [
+    user_content: List[Dict[str, Any]] = []
+
+    if ocr_hint:
+        user_content.append(
+            {
+                "type": "input_text",
+                "text": (
+                    "OCR TEXT (may contain noise, but helps reading):\n"
+                    + ocr_hint[:5000]
+                ),
+            }
+        )
+
+    user_content.append(
         {
             "type": "input_text",
-            "text": "This is a single hospital bill page. Extract all charge line items only.",
-        },
+            "text": "SINGLE hospital bill PAGE image below. Extract charge line items only.",
+        }
+    )
+    user_content.append(
         {
             "type": "input_image",
             "image_url": page_info["data_url"],
             "detail": "high",
-        },
-    ]
+        }
+    )
 
     try:
         response = client.responses.create(
             model=GROQ_VISION_MODEL_MAVERICK,
+            response_format={"type": "json_object"},
             input=[
                 {
                     "role": "system",
-                    "content": [
-                        {"type": "input_text", "text": SYSTEM_PROMPT_MAVERICK.strip()}
-                    ],
+                    "content": [{"type": "input_text", "text": SYSTEM_PROMPT_MAVERICK.strip()}],
                 },
                 {
                     "role": "user",
@@ -615,7 +605,7 @@ def call_groq_for_single_page_maverick(
 
     raw_text = response.output_text.strip()
 
-    # Robust JSON parsing
+    # STRICT JSON
     try:
         parsed = json.loads(raw_text)
     except json.JSONDecodeError:
@@ -623,13 +613,7 @@ def call_groq_for_single_page_maverick(
         last = raw_text.rfind("}")
         if first != -1 and last != -1 and last > first:
             json_str = raw_text[first:last + 1]
-            try:
-                parsed = json.loads(json_str)
-            except Exception:
-                raise HTTPException(
-                    status_code=500,
-                    detail=f"Maverick response is not valid JSON: {raw_text[:200]}",
-                )
+            parsed = json.loads(json_str)
         else:
             raise HTTPException(
                 status_code=500,
@@ -652,6 +636,7 @@ def call_groq_for_single_page_maverick(
             detail="Maverick JSON returned empty pagewise_line_items.",
         )
 
+    # Use first page only (this call is strictly single-page)
     raw_page = raw_pages[0]
     return raw_page, token_usage
 
@@ -771,8 +756,12 @@ def enrich_from_patterns(pages: List[PageItems]) -> List[PageItems]:
                 rates[name_key].append(amt / qty)
                 qtys[name_key].append(qty)
 
-    default_rate = {k: (sum(v) / len(v)) for k, v in rates.items() if v}
-    default_qty = {k: (sum(v) / len(v)) for k, v in qtys.items() if v}
+    default_rate = {
+        k: (sum(v) / len(v)) for k, v in rates.items() if v
+    }
+    default_qty = {
+        k: (sum(v) / len(v)) for k, v in qtys.items() if v
+    }
 
     for p in pages:
         for it in p.bill_items:
@@ -818,19 +807,101 @@ def compute_grand_total_amount(pages: List[PageItems]) -> float:
 
 
 # ============================================================
+#  Mode Helpers – dynamic effort based on pages + mode
+# ============================================================
+
+def get_mode_params(num_pages: int) -> Dict[str, Any]:
+    """
+    Decide:
+      - max_dim for images
+      - max_maverick_pages
+      - batch_size (<= MAX_IMAGES_PER_REQUEST)
+      - use_ocr_for_maverick (bool)
+    based on PIPELINE_MODE and num_pages.
+    """
+    mode = PIPELINE_MODE
+
+    if mode == "speed":
+        max_dim = 850
+        batch_size = min(5, MAX_IMAGES_PER_REQUEST)
+        use_ocr = False
+        # very light refinement
+        if num_pages <= 5:
+            max_mav = min(3, num_pages)
+        elif num_pages <= 15:
+            max_mav = min(4, num_pages)
+        else:
+            max_mav = min(5, num_pages)
+    elif mode == "accuracy":
+        max_dim = 1100
+        batch_size = min(3, MAX_IMAGES_PER_REQUEST)
+        use_ocr = USE_OCR_FOR_MAVERICK
+        # heavy refinement depending on pages
+        if num_pages <= 5:
+            max_mav = num_pages
+        elif num_pages <= 10:
+            max_mav = min(8, num_pages)
+        elif num_pages <= 20:
+            max_mav = min(10, num_pages)
+        else:
+            max_mav = min(12, num_pages)
+    else:  # "balanced"
+        max_dim = 950
+        batch_size = min(4, MAX_IMAGES_PER_REQUEST)
+        use_ocr = USE_OCR_FOR_MAVERICK
+        if num_pages <= 5:
+            max_mav = min(5, num_pages)
+        elif num_pages <= 10:
+            max_mav = min(6, num_pages)
+        elif num_pages <= 20:
+            max_mav = min(7, num_pages)
+        else:
+            max_mav = min(8, num_pages)
+
+    return {
+        "max_dim": max_dim,
+        "batch_size": batch_size,
+        "max_maverick_pages": max_mav,
+        "use_ocr_for_maverick": use_ocr,
+    }
+
+
+def maybe_get_ocr_hint(page_info: Dict[str, Any]) -> Optional[str]:
+    if not HAVE_TESSERACT or not USE_OCR_FOR_MAVERICK:
+        return None
+    try:
+        # Decode base64 to image and run OCR
+        data_url = page_info["data_url"]
+        prefix = "data:image/jpeg;base64,"
+        if not data_url.startswith(prefix):
+            return None
+        b64 = data_url[len(prefix):]
+        img_bytes = base64.b64decode(b64)
+        img = Image.open(io.BytesIO(img_bytes))
+        text = pytesseract.image_to_string(img)
+        return text
+    except Exception:
+        return None
+
+
+# ============================================================
 #  Health Check (GET)
 # ============================================================
 
 @app.get("/extract-bill-data")
 def health_check():
     return {
-        "message": "Health OK. Use POST /extract-bill-data with JSON body "
-                   '{"document": "<public image/PDF URL>"} to extract bill data.'
+        "message": (
+            "Health OK. Use POST /extract-bill-data with JSON body "
+            '{"document": "<public image/PDF URL>"} to extract bill data.'
+        ),
+        "mode": PIPELINE_MODE,
+        "time_budget_sec": TIME_BUDGET_SEC,
     }
 
 
 # ============================================================
-#  Main Datathon Endpoint (POST) – Dynamic controller
+#  Main Datathon Endpoint (POST)
 # ============================================================
 
 @app.post("/extract-bill-data", response_model=ExtractBillDataResponse)
@@ -838,19 +909,15 @@ def extract_bill_data(req: ExtractBillDataRequest):
     start_time = time.time()
     url_str = str(req.document)
 
+    # Decide mode parameters
+    # (need num_pages, so we compute after converting)
     # 1. Download document
     content = download_document(url_str)
 
-    # 2. First convert with default quality; we'll override below using config
-    #    Actually we need num_pages, which is length of page_infos.
-    #    We'll re-generate page_infos after selecting config for proper quality.
-    #    To avoid double PDF render, we do it only ONCE with chosen config,
-    #    so first get num_pages by a quick low-cost page count.
-
-    # For simplicity and speed, directly generate page_infos once
-    # with medium defaults, then re-use (quality impact is minor vs LLM time).
-    temp_page_infos = document_to_page_infos(url_str, content, jpeg_quality=60, max_dim=880)
-    num_pages = len(temp_page_infos)
+    # TEMP placeholder for max_dim until we know num_pages: use balanced default
+    tmp_max_dim = 950
+    tmp_page_infos = document_to_page_infos(url_str, content, max_dim=tmp_max_dim)
+    num_pages = len(tmp_page_infos)
 
     if num_pages == 0:
         elapsed = time.time() - start_time
@@ -863,27 +930,17 @@ def extract_bill_data(req: ExtractBillDataRequest):
             message="No pages/images could be extracted from the document.",
         )
 
-    # 3. Select dynamic inference config based on num_pages
-    cfg = select_inference_config(num_pages)
-    mode = cfg["mode"]
-    batch_size = min(cfg["batch_size"], GROQ_MAX_IMAGES_PER_REQUEST)
-    max_maverick_pages = cfg["max_maverick_pages"]
-    sparse_threshold = cfg["sparse_threshold"]
-    jpeg_quality = cfg["jpeg_quality"]
-    max_dim = cfg["max_dim"]
+    # Recompute with mode-specific max_dim
+    mode_params = get_mode_params(num_pages)
+    max_dim = mode_params["max_dim"]
+    batch_size = mode_params["batch_size"]
+    max_maverick_pages = mode_params["max_maverick_pages"]
+    use_ocr_for_maverick = mode_params["use_ocr_for_maverick"]
 
-    # Rebuild page_infos with mode-specific JPEG quality & resize
-    page_infos = document_to_page_infos(
-        url_str, content, jpeg_quality=jpeg_quality, max_dim=max_dim
-    )
+    page_infos = document_to_page_infos(url_str, content, max_dim=max_dim)
+    num_pages = len(page_infos)  # same as before, but be explicit
 
-    print(
-        f"[MODE] pages={num_pages} mode={mode} "
-        f"batch_size={batch_size} max_maverick_pages={max_maverick_pages} "
-        f"sparse_threshold={sparse_threshold} jpeg_quality={jpeg_quality} max_dim={max_dim}"
-    )
-
-    # 4. Scout pass – process pages in batches
+    # 3. Scout pass – process pages in batches
     all_pages: List[PageItems] = []
     total_tokens = 0
     input_tokens = 0
@@ -906,6 +963,11 @@ def extract_bill_data(req: ExtractBillDataRequest):
             page_items = reconcile_page_items(page_dict)
             all_pages.append(page_items)
 
+        # Soft guard: if we're already way over time, break (but this is rare)
+        elapsed_mid = time.time() - start_time
+        if elapsed_mid > TIME_BUDGET_SEC * 1.2:
+            break
+
     if not all_pages:
         elapsed = time.time() - start_time
         print(
@@ -922,22 +984,39 @@ def extract_bill_data(req: ExtractBillDataRequest):
             message="Model did not return any page items.",
         )
 
-    # 5. Maverick refinement on suspicious pages (dynamic, best-effort)
+    # 4. Decide suspicious pages for Maverick refinement
+    #    (very sparse pages OR pages labeled 'Final Bill')
     suspicious_indices: List[int] = []
     for idx, p in enumerate(all_pages):
-        # Sparse page: very few items
-        if len(p.bill_items) <= sparse_threshold:
+        if len(p.bill_items) <= 1:
             suspicious_indices.append(idx)
-        # Final bill page: important
         elif p.page_type.strip().lower() == "final bill":
             suspicious_indices.append(idx)
 
+    # Sort for determinism
+    suspicious_indices = sorted(set(suspicious_indices))
+
+    # Cap refinement based on mode/pages & remaining time
     suspicious_indices = suspicious_indices[:max_maverick_pages]
 
+    # 5. Maverick refinement (strict, best-effort; if error, keep Scout result)
     for idx in suspicious_indices:
+        elapsed_now = time.time() - start_time
+        remaining = TIME_BUDGET_SEC - elapsed_now
+
+        # If we're too close to the budget, skip further Maverick calls
+        if remaining < 10:
+            print(f"[MAVERICK_SKIP] page={idx+1} reason=time_budget_low remaining={remaining:.2f}")
+            break
+
+        ocr_hint = None
+        if use_ocr_for_maverick:
+            ocr_hint = maybe_get_ocr_hint(page_infos[idx])
+
         try:
             raw_page_mav, usage_mav = call_groq_for_single_page_maverick(
-                page_infos[idx]
+                page_infos[idx],
+                ocr_hint=ocr_hint,
             )
         except HTTPException as e:
             print(f"[MAVERICK_SKIP] page={idx+1} reason={e.detail}")
@@ -971,11 +1050,9 @@ def extract_bill_data(req: ExtractBillDataRequest):
     elapsed = time.time() - start_time
 
     print(
-        f"[BILL_EXTRACT] pages={num_pages} mode={mode} "
-        f"items={data.total_item_count} "
-        f"total_amount={grand_total:.2f} "
-        f"tokens={token_usage.total_tokens} "
-        f"time_sec={elapsed:.2f}"
+        f"[BILL_EXTRACT] mode={PIPELINE_MODE} pages={num_pages} "
+        f"items={data.total_item_count} total_amount={grand_total:.2f} "
+        f"tokens={token_usage.total_tokens} time_sec={elapsed:.2f}"
     )
 
     return ExtractBillDataResponse(
