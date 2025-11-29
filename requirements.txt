@@ -7,6 +7,8 @@ openai>=1.40.0  # for Responses API client with base_url support
 python-multipart
 
 
+
+
 httpx
 pydantic
 
@@ -16,6 +18,4 @@ pytesseract
 
 opencv-python
 numpy
-surya-ocr
-python-Levenshtein
-# onnxruntime
+
