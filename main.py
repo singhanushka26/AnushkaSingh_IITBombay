@@ -15,6 +15,7 @@ from pydantic import BaseModel, HttpUrl
 from pdf2image import convert_from_bytes
 from PIL import Image, ImageEnhance
 from openai import OpenAI
+import pytesseract  # OCR for high recall on tables
 
 # ============================================================
 #  Groq Client (OpenAI-compatible)
@@ -25,10 +26,10 @@ client = OpenAI(
     base_url="https://api.groq.com/openai/v1",
 )
 
-# Fast + good accuracy
+# High-accuracy vision model (Maverick) – default
 GROQ_VISION_MODEL_ID = os.environ.get(
     "GROQ_VISION_MODEL_ID",
-    "meta-llama/llama-4-scout-17b-16e-instruct",
+    "meta-llama/llama-4-maverick-17b-128e-instruct",
 )
 
 # Groq Vision limit: MAX 5 images per request
@@ -80,12 +81,11 @@ class ExtractBillDataResponse(BaseModel):
 
 app = FastAPI(
     title="Bajaj Datathon Bill Extraction API",
-    version="6.0.0",
+    version="7.0.0",
     description=(
-        "Extracts line items from multi-page bill/invoice documents using "
-        "Groq vision models with batching (max 5 images per request). "
-        "Implements the exact HackRx Datathon schema and is tuned for "
-        "high accuracy while staying under time limits on large PDFs."
+        "High-accuracy extraction of line items from multi-page hospital bills "
+        "using OCR + Groq LLaMA 4 Maverick vision in batched mode. "
+        "Implements the exact HackRx Datathon schema."
     ),
 )
 
@@ -120,7 +120,6 @@ def guess_mime_type(url: str, content: bytes) -> str:
 def _resize_for_vision(img: Image.Image, max_dim: int = 950) -> Image.Image:
     """
     Downscale to reduce tokens & latency while keeping table details readable.
-    Slightly smaller than before for better speed on 30+ pages.
     """
     w, h = img.size
     scale = max(w, h) / float(max_dim)
@@ -133,12 +132,29 @@ def _resize_for_vision(img: Image.Image, max_dim: int = 950) -> Image.Image:
 
 def _enhance_for_vision(img: Image.Image) -> Image.Image:
     """
-    Light contrast + sharpness boost to help faint numeric columns
-    (like those IP CONSULTATION CHARGES pages).
+    Light contrast + sharpness boost to help faint numeric columns.
     """
     img = ImageEnhance.Contrast(img).enhance(1.6)
     img = ImageEnhance.Sharpness(img).enhance(1.4)
     return img
+
+
+def _ocr_page(img: Image.Image) -> str:
+    """
+    Run Tesseract OCR on a page to get raw text lines.
+    This greatly increases recall of all table rows.
+    """
+    try:
+        gray = img.convert("L")
+        gray = ImageEnhance.Contrast(gray).enhance(1.8)
+        text = pytesseract.image_to_string(
+            gray,
+            config="--psm 6"  # Assume a single uniform block of text (tables)
+        )
+        return text
+    except Exception:
+        # Fallback: no OCR, model will rely on vision only
+        return ""
 
 
 def image_to_data_url(img: Image.Image, quality: int = 60) -> str:
@@ -173,7 +189,8 @@ def document_to_page_infos(url: str, content: bytes) -> List[Dict[str, Any]]:
 
         {
           "page_index": int,   # 0-based
-          "data_url": "data:image/jpeg;base64,..."
+          "data_url": "data:image/jpeg;base64,...",
+          "ocr_text": "<raw OCR text of the page>"
         }
     """
     mime = guess_mime_type(url, content)
@@ -189,10 +206,12 @@ def document_to_page_infos(url: str, content: bytes) -> List[Dict[str, Any]]:
                 detail=f"Unable to open image document: {e}",
             )
 
+        ocr_text = _ocr_page(img)
         page_infos.append(
             {
                 "page_index": 0,
                 "data_url": image_to_data_url(img),
+                "ocr_text": ocr_text,
             }
         )
         return page_infos
@@ -213,10 +232,12 @@ def document_to_page_infos(url: str, content: bytes) -> List[Dict[str, Any]]:
 
         for idx, p in enumerate(pages):
             img = p.convert("RGB")
+            ocr_text = _ocr_page(img)
             page_infos.append(
                 {
                     "page_index": idx,
                     "data_url": image_to_data_url(img),
+                    "ocr_text": ocr_text,
                 }
             )
         return page_infos
@@ -230,17 +251,19 @@ def document_to_page_infos(url: str, content: bytes) -> List[Dict[str, Any]]:
             detail=f"Unsupported document type: {mime}",
         )
 
+    ocr_text = _ocr_page(img)
     page_infos.append(
         {
             "page_index": 0,
             "data_url": image_to_data_url(img),
+            "ocr_text": ocr_text,
         }
     )
     return page_infos
 
 
 # ============================================================
-#  LLM Prompt – batched, strict JSON, handle repeated rows
+#  LLM Prompt – batched, OCR + vision, strict JSON
 # ============================================================
 
 SYSTEM_PROMPT = """
@@ -249,50 +272,46 @@ You are an expert medical BILL ITEM extraction engine for hospital bills.
 Your goals:
 
 1) Capture EVERY genuine line item from the tables (high recall).
-2) Do NOT double-count or duplicate the same line item when it is only a summary.
+2) Do NOT double-count or duplicate the same line item.
 3) Make the sum of all `item_amount` values across all pages as close as possible
    to the FINAL TOTAL printed in the bill.
 4) Respect the exact JSON structure required by the HackRx Datathon.
 
-CRITICAL BEHAVIOUR FOR REPEATED ROWS:
+You are given, for each page:
+- Full OCR TEXT of that page (primary source of truth).
+- The page IMAGE (for visual confirmation only).
 
-- If the same row appears MANY TIMES (e.g. many rows with
-  "IP CONSULTATION CHARGES  Qty 1  Rate 1000  Amount 1000")
-  then you MUST output ONE BILL ITEM PER VISUAL ROW.
-  Example: if 20 such rows are visible, you must output 20 bill_items
-  with the same name & numbers (do NOT collapse them into one).
+CRITICAL BEHAVIOUR:
 
-- Section totals such as "TOTAL", "SUB TOTAL", "GRAND TOTAL",
-  "NET AMOUNT PAYABLE", etc. MUST NOT be emitted as bill_items.
+- Treat the OCR text lines as the canonical rows of the table.
+- For EACH visual/OCR row that describes a charge, output exactly ONE bill item.
+- Do NOT merge multiple rows into one item, even if the service name is similar.
+- Do NOT invent new rows which do not exist in the OCR text.
+
+- Section totals such as "TOTAL", "SUB TOTAL", "SUB-TOTAL",
+  "GRAND TOTAL", "NET AMOUNT PAYABLE", "NET PAYABLE", "ROUND OFF",
+  "DISCOUNT", etc. MUST NOT be emitted as bill_items.
 
 NUMERIC RULES:
 
-- item_quantity: read from columns like "Qty", "No. of Days", etc.
+- item_quantity: read from "Qty", "No. of Days", or similar columns.
 - item_rate:     from "Rate", "Charges per day", etc.
-- item_amount:   from "Amount", "Net Amt", etc.
+- item_amount:   from "Amount", "Net Amt", "Company Amount", etc.
+- If there are multiple numeric columns, choose the column that
+  represents the NET amount being charged in that row.
 
 If some numeric fields are missing for a row BUT other rows with the
-same description show clear numbers, use that pattern:
-
-  • If at least one row for the same item_name has
-        quantity = q0 and amount = a0 (or rate = r0),
-    then for rows where the numeric values are unreadable you may assume:
-        quantity = q0
-        rate     = a0 / q0 (or r0)
-        amount   = quantity * rate
-
-This means you may RECONSTRUCT missing amounts using the pattern of
-other rows with the same description (e.g. repeated consultation charges).
-
-If a numeric field is still unknown after this reasoning, set it to 0.0.
+same service name have clear numbers, you may infer the missing numbers
+as long as they are consistent with the pattern (e.g. same rate per unit).
+Otherwise, set unknown numeric fields to 0.0.
 
 OUTPUT FORMAT (PER BATCH):
 
-You will see K page images in this batch, in order.
+You will see K page images and OCR texts in this batch, in order.
 For EACH page i in this batch (1-based):
 
 - Decide page_type ∈ {"Bill Detail", "Final Bill", "Pharmacy"}.
-- Extract ALL line items for that page (one per visual row).
+- Extract ALL line items for that page (one per genuine charge row).
 
 Return ONE STRICT JSON object ONLY (no markdown):
 
@@ -321,7 +340,8 @@ Return ONE STRICT JSON object ONLY (no markdown):
 STRICT REQUIREMENTS:
 - JSON ONLY. No ```json, no headings, no commentary.
 - No extra keys at top level or inside any object.
-- Do NOT output totals, sub-totals, taxes, or summary-only rows as bill_items.
+- Do NOT output totals, sub-totals, taxes, discounts, round-off,
+  or any summary-only rows as bill_items.
 """
 
 
@@ -337,12 +357,16 @@ def call_groq_for_batch(
     num_batch_pages = len(batch_page_infos)
 
     user_text = f"""
-You are given a BATCH of {num_batch_pages} page image(s) from a hospital bill.
+You are given a BATCH of {num_batch_pages} page(s) from a hospital bill.
 
-The images will be provided in order for this batch:
-first image is batch page 1, second is batch page 2, ..., up to batch page {num_batch_pages}.
+For EACH batch page i (1-based), you receive:
+1) OCR TEXT for that page.
+2) The page IMAGE for confirmation.
 
-For EACH batch page i (1-based), you must:
+Use the OCR TEXT as the primary source of rows and numbers, and use the
+image only to resolve ambiguities.
+
+For EACH batch page i you must:
 - Set page_no = "<i>" (as a string)
 - Choose page_type from: "Bill Detail", "Final Bill", "Pharmacy"
 - Extract bill_items ONLY for that page.
@@ -354,10 +378,20 @@ For EACH batch page i (1-based), you must:
 
     for idx, info in enumerate(batch_page_infos):
         batch_page_no = idx + 1
+        ocr_text = (info.get("ocr_text") or "").strip()
+
         user_content.append(
             {
                 "type": "input_text",
-                "text": f"BATCH PAGE {batch_page_no} IMAGE BELOW.",
+                "text": f"=== BATCH PAGE {batch_page_no} OCR TEXT START ===\n"
+                        f"{ocr_text}\n"
+                        f"=== BATCH PAGE {batch_page_no} OCR TEXT END ===",
+            }
+        )
+        user_content.append(
+            {
+                "type": "input_text",
+                "text": f"Image for BATCH PAGE {batch_page_no} is below.",
             }
         )
         user_content.append(
@@ -451,7 +485,7 @@ For EACH batch page i (1-based), you must:
 
 
 # ============================================================
-#  Reconcile, Clean & Aggregate
+#  Reconcile, Clean, Deduplicate & Aggregate
 # ============================================================
 
 def _coerce_number(x: Any) -> float:
@@ -472,13 +506,27 @@ def _coerce_number(x: Any) -> float:
     return 0.0
 
 
+SUMMARY_KEYWORDS = (
+    "TOTAL",
+    "SUB TOTAL",
+    "SUB-TOTAL",
+    "GRAND TOTAL",
+    "NET AMOUNT",
+    "NET PAYABLE",
+    "NET AMT",
+    "ROUND OFF",
+    "ROUND-OFF",
+    "ROUND OFF AMT",
+    "DISCOUNT",
+)
+
+
 def clean_page_dict(page_dict: Dict[str, Any]) -> Dict[str, Any]:
     """
     Pre-clean the raw JSON dict from the model so that Pydantic parsing will not
     fail when numeric fields are null/empty/etc.
 
-    IMPORTANT: We DO NOT dedupe within a page here – multiple identical rows
-    (e.g. many IP CONSULTATION CHARGES) must be preserved as separate items.
+    We also drop obvious summary/total rows by keywords.
     """
     bill_items = page_dict.get("bill_items", []) or []
     cleaned_items: List[Dict[str, Any]] = []
@@ -488,6 +536,14 @@ def clean_page_dict(page_dict: Dict[str, Any]) -> Dict[str, Any]:
             continue
 
         name = str(item.get("item_name", "")).strip()
+        if not name:
+            continue
+
+        upper_name = name.upper()
+        # Drop obvious totals / summary lines
+        if any(k in upper_name for k in SUMMARY_KEYWORDS):
+            continue
+
         amount = _coerce_number(item.get("item_amount"))
         rate = _coerce_number(item.get("item_rate"))
         qty = _coerce_number(item.get("item_quantity"))
@@ -542,21 +598,58 @@ def reconcile_page_items(page_dict: Dict[str, Any]) -> PageItems:
     return page_items
 
 
+def dedupe_with_ocr(page: PageItems, ocr_text: str) -> PageItems:
+    """
+    Use OCR text to drop hallucinated duplicate rows.
+
+    Idea:
+      - Count how many times each item_name appears in OCR text.
+      - Model is not allowed to output that item more times than OCR count.
+      - Keep the first N occurrences in original order.
+    """
+    if not ocr_text:
+        return page
+
+    text_lower = ocr_text.lower()
+    name_counts_model: Dict[str, int] = defaultdict(int)
+    for item in page.bill_items:
+        key = item.item_name.strip().lower()
+        name_counts_model[key] += 1
+
+    allowed_counts: Dict[str, int] = {}
+    for name, model_count in name_counts_model.items():
+        occ = text_lower.count(name)
+        if occ <= 0:
+            # OCR may be noisy; in that case, trust the model count.
+            allowed_counts[name] = model_count
+        else:
+            allowed_counts[name] = min(model_count, occ)
+
+    seen: Dict[str, int] = defaultdict(int)
+    new_items: List[BillItem] = []
+    for item in page.bill_items:
+        key = item.item_name.strip().lower()
+        if seen[key] < allowed_counts.get(key, 0):
+            new_items.append(item)
+            seen[key] += 1
+        else:
+            # extra hallucinated duplicate – drop it
+            continue
+
+    page.bill_items = new_items
+    return page
+
+
 def enrich_from_patterns(pages: List[PageItems]) -> List[PageItems]:
     """
-    SECOND PASS (Option B):
+    SECOND PASS (conservative):
     If some rows have missing numeric fields, but other rows with the same
-    item_name have good numbers, use that pattern to fill in.
+    item_name have a SINGLE consistent (rate, qty) pattern, use that to fill.
 
-    Example:
-        - Several 'IP CONSULTATION CHARGES' rows have amount=1000, qty=1.
-        - Others have amount=0 (unreadable). We set:
-              qty = 1, rate = 1000, amount = 1000.
+    This is intentionally conservative to avoid corrupting correct values.
     """
     # 1) Collect per-name statistics
-    rates = defaultdict(list)  # name -> list of inferred rates
-    qtys = defaultdict(list)   # name -> list of typical quantities
-
+    patterns: Dict[str, set] = defaultdict(set)  # name -> set of (rate, qty)
     for p in pages:
         for it in p.bill_items:
             name_key = it.item_name.strip().lower()
@@ -565,20 +658,20 @@ def enrich_from_patterns(pages: List[PageItems]) -> List[PageItems]:
             qty = float(it.item_quantity)
 
             if rate > 0 and qty > 0:
-                rates[name_key].append(rate)
-                qtys[name_key].append(qty)
+                patterns[name_key].add((round(rate, 4), round(qty, 4)))
             elif amt > 0 and qty > 0:
-                rates[name_key].append(amt / qty)
-                qtys[name_key].append(qty)
+                inferred_rate = amt / qty
+                patterns[name_key].add((round(inferred_rate, 4), round(qty, 4)))
 
-    default_rate = {
-        k: (sum(v) / len(v)) for k, v in rates.items() if v
-    }
-    default_qty = {
-        k: (sum(v) / len(v)) for k, v in qtys.items() if v
-    }
+    # 2) Build defaults only when there is a SINGLE consistent pattern
+    defaults: Dict[str, Tuple[float, float]] = {}
+    for name, pats in patterns.items():
+        if len(pats) == 1:
+            r, q = list(pats)[0]
+            if r > 0 and q > 0:
+                defaults[name] = (r, q)
 
-    # 2) Fill missing fields using defaults
+    # 3) Fill missing fields using defaults
     for p in pages:
         for it in p.bill_items:
             name_key = it.item_name.strip().lower()
@@ -586,21 +679,26 @@ def enrich_from_patterns(pages: List[PageItems]) -> List[PageItems]:
             rate = float(it.item_rate)
             qty = float(it.item_quantity)
 
-            dr = default_rate.get(name_key)
-            dq = default_qty.get(name_key, 1.0)
+            default = defaults.get(name_key)
+            if not default:
+                # No reliable pattern; leave as is
+                it.item_quantity = float(qty if qty > 0 else 1.0)
+                it.item_rate = round(float(rate), 2) if rate > 0 else 0.0
+                it.item_amount = round(float(amt), 2) if amt > 0 else 0.0
+                continue
 
-            # Only try to "guess" when numbers are clearly missing / zero
-            if dr is not None:
-                if qty <= 0:
-                    qty = dq or 1.0
-                if rate <= 0 and amt > 0 and qty > 0:
-                    rate = amt / qty
-                if rate <= 0 and amt <= 0:
-                    rate = dr
-                if amt <= 0 and rate > 0 and qty > 0:
-                    amt = rate * qty
+            default_rate, default_qty = default
 
-            # Write back (rounded)
+            # Only modify fields that are missing / zero
+            if qty <= 0:
+                qty = default_qty
+            if rate <= 0 and amt > 0 and qty > 0:
+                rate = amt / qty
+            if rate <= 0:
+                rate = default_rate
+            if amt <= 0 and rate > 0 and qty > 0:
+                amt = rate * qty
+
             it.item_quantity = float(qty if qty > 0 else 1.0)
             it.item_rate = round(float(rate), 2) if rate > 0 else 0.0
             it.item_amount = round(float(amt), 2) if amt > 0 else 0.0
@@ -625,7 +723,7 @@ def compute_grand_total_amount(pages: List[PageItems]) -> float:
 
 
 # ============================================================
-#  Health Check (GET)
+#  Health Check (GET on same endpoint)
 # ============================================================
 
 @app.get("/extract-bill-data")
@@ -648,7 +746,7 @@ def extract_bill_data(req: ExtractBillDataRequest):
     # 1. Download document
     content = download_document(url_str)
 
-    # 2. Convert to per-page infos (image → data_url)
+    # 2. Convert to per-page infos (image → data_url + ocr_text)
     page_infos = document_to_page_infos(url_str, content)
     num_pages = len(page_infos)
 
@@ -679,11 +777,17 @@ def extract_bill_data(req: ExtractBillDataRequest):
         input_tokens += usage_batch.input_tokens
         output_tokens += usage_batch.output_tokens
 
-        # Map batch-local page_no → global page_no
+        # Map batch-local page_no → global page_no and apply OCR-based dedup
         for i, page_dict in enumerate(raw_pages_batch):
             global_page_no = batch_start + i + 1  # 1-based for entire document
             page_dict["page_no"] = str(global_page_no)
+
             page_items = reconcile_page_items(page_dict)
+
+            # OCR-based dedup for this page
+            ocr_text = batch_page_infos[i].get("ocr_text") or ""
+            page_items = dedupe_with_ocr(page_items, ocr_text)
+
             all_pages.append(page_items)
 
     if not all_pages:
@@ -702,7 +806,7 @@ def extract_bill_data(req: ExtractBillDataRequest):
             message="Model did not return any page items.",
         )
 
-    # 4. Enrich missing numeric fields using global patterns (Option B)
+    # 4. Enrich missing numeric fields using conservative global patterns
     all_pages = enrich_from_patterns(all_pages)
 
     # 5. Aggregate
