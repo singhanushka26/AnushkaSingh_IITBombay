@@ -1,46 +1,44 @@
 import base64
 import io
 import json
-import math
-import mimetypes
 import os
 import time
 import asyncio
-from typing import List, Optional, Tuple, Any, Dict
+import mimetypes
 from collections import defaultdict
+from typing import List, Optional, Tuple, Any, Dict
 
 import requests
-import cv2  # OpenCV for the "Differentiator" (Preprocessing)
 import numpy as np
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, HttpUrl
+
+# Replaces OpenCV for Railway compatibility
+from PIL import Image, ImageEnhance, ImageOps 
 from pdf2image import convert_from_bytes
-from PIL import Image, ImageEnhance
 from openai import AsyncOpenAI
 
 # ============================================================
 #   Configuration
 # ============================================================
 
-# Initialize Async Client for parallel processing
 client = AsyncOpenAI(
     api_key=os.environ.get("GROQ_API_KEY"),
     base_url="https://api.groq.com/openai/v1",
 )
 
-# Using the standard Llama 3.2 Vision model (High speed/Good accuracy)
+# Llama 3.2 11B Vision: Best balance of speed/accuracy for Datathons
 GROQ_VISION_MODEL_ID = os.environ.get(
     "GROQ_VISION_MODEL_ID",
-    "llama-3.2-11b-vision-preview" 
+    "llama-3.2-11b-vision-preview"
 )
 
-# STRICT CONSTRAINT: Process exactly 5 pages in parallel.
-# This respects your "cannot handle more than 5 pages in one go" rule
-# while ensuring 5x speedup over sequential processing.
+# STRICT CONSTRAINT: Max 5 concurrent requests to respect rate limits
+# and "5 pages in one go" rule.
 MAX_CONCURRENT_REQUESTS = 5
 
 # ============================================================
-#   Pydantic Schemas (Exact Datathon Spec)
+#   Pydantic Models
 # ============================================================
 
 class BillItem(BaseModel):
@@ -76,40 +74,37 @@ class ExtractBillDataResponse(BaseModel):
 #   FastAPI App
 # ============================================================
 
-app = FastAPI(
-    title="Bajaj Datathon Bill Extraction API",
-    description="High-accuracy extraction using Bounded Async Parallelism (Max 5)."
-)
+app = FastAPI(title="Bajaj Datathon API - Railway Compatible")
 
 # ============================================================
-#   Image Processing (The Differentiator)
+#   Image Processing (Pure PIL - No OpenCV)
 # ============================================================
 
-def preprocess_image_opencv(pil_image: Image.Image) -> Image.Image:
+def preprocess_image_pil(img: Image.Image) -> Image.Image:
     """
-    DIFFERENTIATOR: Uses Adaptive Thresholding to handle scanned photos,
-    shadows, and uneven lighting. This dramatically improves OCR accuracy.
+    Railway-safe preprocessing. 
+    Uses PIL instead of OpenCV to remove shadows and enhance text.
     """
-    # Convert PIL to OpenCV format
-    open_cv_image = np.array(pil_image)
-    # Convert RGB to BGR
-    open_cv_image = open_cv_image[:, :, ::-1].copy()
+    # 1. Convert to Grayscale
+    img = img.convert("L")
     
-    # 1. Grayscale
-    gray = cv2.cvtColor(open_cv_image, cv2.COLOR_BGR2GRAY)
+    # 2. Auto-Contrast (Cutoff 1% of pixels) - removes grey/shadow background
+    img = ImageOps.autocontrast(img, cutoff=1)
     
-    # 2. Adaptive Thresholding
-    # This calculates the threshold for small regions, perfect for shadows
-    binary = cv2.adaptiveThreshold(
-        gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2
-    )
+    # 3. Increase Sharpness (Helps OCR read edges)
+    enhancer = ImageEnhance.Sharpness(img)
+    img = enhancer.enhance(2.0)  # Double sharpness
     
-    return Image.fromarray(binary)
+    # 4. Slight Contrast Boost
+    enhancer = ImageEnhance.Contrast(img)
+    img = enhancer.enhance(1.5)
+    
+    # Convert back to RGB for the model
+    return img.convert("RGB")
 
 def image_to_data_url(img: Image.Image, max_dim: int = 1600) -> str:
     """
-    Resizes image and converts to base64.
-    Increased max_dim to 1600 because medical bills have small decimals.
+    Resize and encode. max_dim=1600 ensures decimals are readable.
     """
     w, h = img.size
     scale = max(w, h) / float(max_dim)
@@ -119,15 +114,11 @@ def image_to_data_url(img: Image.Image, max_dim: int = 1600) -> str:
         new_h = int(h / scale)
         img = img.resize((new_w, new_h), Image.LANCZOS)
     
-    # Apply the Differentiator Preprocessing
-    try:
-        img = preprocess_image_opencv(img)
-    except Exception as e:
-        print(f"OpenCV processing failed, falling back to PIL: {e}")
-        img = ImageEnhance.Contrast(img).enhance(1.5)
-        img = ImageEnhance.Sharpness(img).enhance(1.5)
+    # Apply Railway-safe preprocessing
+    img = preprocess_image_pil(img)
 
     buf = io.BytesIO()
+    # High quality JPEG
     img.save(buf, format="JPEG", quality=85)
     b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
     return f"data:image/jpeg;base64,{b64}"
@@ -138,10 +129,9 @@ def download_document(url: str) -> bytes:
         resp.raise_for_status()
         return resp.content
     except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=400, detail=f"Download failed: {e}")
 
 def document_to_page_infos(url: str, content: bytes) -> List[Dict[str, Any]]:
-    # Guess Mime
     mime, _ = mimetypes.guess_type(url)
     if not mime and content[:4] == b"%PDF":
         mime = "application/pdf"
@@ -150,21 +140,24 @@ def document_to_page_infos(url: str, content: bytes) -> List[Dict[str, Any]]:
     
     if mime == "application/pdf":
         try:
-            # Requires poppler-utils installed on system
+            # Note: On Railway, you may need to add 'poppler-utils' via Nixpacks 
+            # if this fails. But usually pdf2image handles bytes well.
             pil_images = convert_from_bytes(content)
         except Exception as e:
-             raise HTTPException(status_code=400, detail=f"PDF Error: {e}")
+             raise HTTPException(
+                 status_code=400, 
+                 detail=f"PDF Conversion Error (Ensure poppler is installed): {e}"
+             )
     else:
         try:
             pil_images = [Image.open(io.BytesIO(content)).convert("RGB")]
         except Exception as e:
              raise HTTPException(status_code=400, detail=f"Image Error: {e}")
 
-    # Return list of dicts to be processed
     return [{"page_index": i, "pil_image": img} for i, img in enumerate(pil_images)]
 
 # ============================================================
-#   Prompts & Async Logic
+#   Prompt & Async Logic
 # ============================================================
 
 SYSTEM_PROMPT = """
@@ -197,15 +190,15 @@ async def process_single_page(
     semaphore: asyncio.Semaphore
 ) -> Tuple[Dict[str, Any], TokenUsage]:
     """
-    Process a single page. The semaphore limits us to MAX_CONCURRENT_REQUESTS (5).
+    Process one page with concurrency limit.
     """
     page_idx = page_info["page_index"]
     pil_img = page_info["pil_image"]
     
-    # Preprocess & Encode
+    # Resize & Enhance (Pure Python)
     b64_url = image_to_data_url(pil_img)
     
-    async with semaphore:  # This line enforces the "Max 5" limit
+    async with semaphore:
         try:
             response = await client.chat.completions.create(
                 model=GROQ_VISION_MODEL_ID,
@@ -222,7 +215,7 @@ async def process_single_page(
                         ]
                     }
                 ],
-                temperature=0.1,  # Low temp for accuracy
+                temperature=0.1,
                 max_tokens=2048,
                 response_format={"type": "json_object"}
             )
@@ -237,16 +230,13 @@ async def process_single_page(
             
             try:
                 data = json.loads(content)
-                # Handle model potentially wrapping output in extra keys
                 if "pagewise_line_items" in data:
                      data = data["pagewise_line_items"][0]
                 
-                # Ensure page_no is set correctly
                 data["page_no"] = str(page_idx + 1)
                 return data, token_usage
-                
             except json.JSONDecodeError:
-                print(f"JSON Decode Error on Page {page_idx+1}")
+                # Return empty page on JSON error so entire process doesn't fail
                 return {
                     "page_no": str(page_idx + 1),
                     "page_type": "Error",
@@ -254,8 +244,7 @@ async def process_single_page(
                 }, token_usage
 
         except Exception as e:
-            print(f"API Error on Page {page_idx+1}: {e}")
-            # Return empty structure on failure so other pages still succeed
+            print(f"Page {page_idx+1} failed: {e}")
             return {
                 "page_no": str(page_idx + 1),
                 "page_type": "Error",
@@ -263,7 +252,7 @@ async def process_single_page(
             }, TokenUsage(total_tokens=0, input_tokens=0, output_tokens=0)
 
 # ============================================================
-#   Helpers: Cleaning & Pattern Enrichment
+#   Data Cleaning & Aggregation
 # ============================================================
 
 def _coerce_number(x: Any) -> float:
@@ -277,7 +266,6 @@ def _coerce_number(x: Any) -> float:
     return 0.0
 
 def reconcile_page_items(page_dict: Dict[str, Any]) -> PageItems:
-    """Clean and validate raw JSON from LLM"""
     raw_items = page_dict.get("bill_items", []) or []
     cleaned_items = []
     
@@ -297,14 +285,11 @@ def reconcile_page_items(page_dict: Dict[str, Any]) -> PageItems:
     )
 
 def enrich_from_patterns(pages: List[PageItems]) -> List[PageItems]:
-    """
-    Improves accuracy by using patterns from clear rows to fix unclear rows.
-    (e.g., if one 'Consultation' row has Price=1000, assume others do too)
-    """
+    """Pattern matching to fill missing rates/quantities"""
     rates = defaultdict(list)
     qtys = defaultdict(list)
 
-    # Pass 1: Collect patterns
+    # Learn patterns
     for p in pages:
         for it in p.bill_items:
             name_key = it.item_name.strip().lower()
@@ -316,20 +301,14 @@ def enrich_from_patterns(pages: List[PageItems]) -> List[PageItems]:
     avg_rate = {k: sum(v)/len(v) for k, v in rates.items() if v}
     avg_qty = {k: sum(v)/len(v) for k, v in qtys.items() if v}
 
-    # Pass 2: Fill gaps
+    # Apply patterns
     for p in pages:
         for it in p.bill_items:
             name_key = it.item_name.strip().lower()
-            
-            # If Qty missing, infer from average
             if it.item_quantity <= 0 and name_key in avg_qty:
                 it.item_quantity = avg_qty[name_key]
-            
-            # If Rate missing, infer from average
             if it.item_rate <= 0 and name_key in avg_rate:
                 it.item_rate = avg_rate[name_key]
-            
-            # Recalculate Amount if missing but Rate/Qty exist
             if it.item_amount <= 0 and it.item_rate > 0 and it.item_quantity > 0:
                 it.item_amount = it.item_rate * it.item_quantity
                 
@@ -337,7 +316,6 @@ def enrich_from_patterns(pages: List[PageItems]) -> List[PageItems]:
 
 def aggregate_all_pages(pages: List[PageItems]) -> ExtractBillDataResponseData:
     total_items = sum(len(p.bill_items) for p in pages)
-    # Sort by page number to be nice
     pages.sort(key=lambda x: int(x.page_no) if x.page_no.isdigit() else 0)
     return ExtractBillDataResponseData(pagewise_line_items=pages, total_item_count=total_items)
 
@@ -345,12 +323,15 @@ def aggregate_all_pages(pages: List[PageItems]) -> ExtractBillDataResponseData:
 #   Main Endpoint
 # ============================================================
 
+@app.get("/")
+def home():
+    return {"status": "Active", "model": GROQ_VISION_MODEL_ID}
+
 @app.post("/extract-bill-data", response_model=ExtractBillDataResponse)
 async def extract_bill_data(req: ExtractBillDataRequest):
     start_time = time.time()
     url_str = str(req.document)
 
-    # 1. Download & Convert
     try:
         content = download_document(url_str)
         raw_pages = document_to_page_infos(url_str, content)
@@ -360,14 +341,13 @@ async def extract_bill_data(req: ExtractBillDataRequest):
     if not raw_pages:
         return ExtractBillDataResponse(is_success=False, message="No pages found.")
 
-    # 2. Async Parallel Processing (Bounded by MAX_CONCURRENT_REQUESTS = 5)
+    # Async Processing with Semaphore
     semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
     tasks = [process_single_page(p, semaphore) for p in raw_pages]
     
-    # Run all tasks (but only 5 active at a time)
     results = await asyncio.gather(*tasks)
 
-    # 3. Aggregate Results
+    # Aggregation
     all_pages_data = []
     total_tokens = 0
     input_tokens = 0
@@ -381,7 +361,7 @@ async def extract_bill_data(req: ExtractBillDataRequest):
         input_tokens += res_usage.input_tokens
         output_tokens += res_usage.output_tokens
 
-    # 4. Post-Processing & Pattern Enrichment
+    # Post-processing
     if all_pages_data:
         all_pages_data = enrich_from_patterns(all_pages_data)
 
