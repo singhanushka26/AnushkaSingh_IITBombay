@@ -14,6 +14,14 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, HttpUrl
 from pdf2image import convert_from_bytes
 from PIL import Image, ImageEnhance
+
+try:
+    import pytesseract  # OCR
+    OCR_LIB_AVAILABLE = True
+except ImportError:
+    pytesseract = None
+    OCR_LIB_AVAILABLE = False
+
 from openai import OpenAI
 
 # ============================================================
@@ -37,12 +45,23 @@ GROQ_VISION_MODEL_MAVERICK = os.environ.get(
     "meta-llama/llama-4-maverick-17b-128e-instruct",
 )
 
-# Groq Vision limit: MAX 5 images per request
-MAX_IMAGES_PER_REQUEST = 3
+# ============================================================
+#  Balanced Mode Hyperparameters (tuned for speed + accuracy)
+# ============================================================
 
-# Max pages to refine with Maverick (speed control)
-MAX_MAVERICK_PAGES = 3
+# Image pre-processing
+RESIZE_MAX_DIM = int(os.environ.get("RESIZE_MAX_DIM", "750"))   # smaller → faster, fewer tokens
+JPEG_QUALITY = int(os.environ.get("JPEG_QUALITY", "50"))        # 40–60 is a good range
 
+# LLM batching
+MAX_IMAGES_PER_REQUEST = int(os.environ.get("MAX_IMAGES_PER_REQUEST", "3"))  # per Scout call
+
+# Maverick refinement
+MAX_MAVERICK_PAGES = int(os.environ.get("MAX_MAVERICK_PAGES", "2"))  # per document
+
+# OCR usage
+OCR_ENABLED = os.environ.get("OCR_ENABLED", "true").lower() == "true"
+MIN_ITEMS_FOR_OK = int(os.environ.get("MIN_ITEMS_FOR_OK", "3"))      # if < this, page is suspicious
 
 # ============================================================
 #  Pydantic Schemas – EXACT Datathon spec
@@ -88,14 +107,12 @@ class ExtractBillDataResponse(BaseModel):
 # ============================================================
 
 app = FastAPI(
-    title="Bajaj Datathon Bill Extraction API",
+    title="Bajaj Datathon Bill Extraction API – Balanced Mode",
     version="8.0.0",
     description=(
-        "Extracts line items from multi-page hospital bills using "
-        "Groq vision models with batching (max 5 images per request). "
-        "Scout does fast bulk extraction; Maverick refines only a few "
-        "suspicious pages. Auto-cropping + optional OCR for speed & accuracy. "
-        "Implements the exact HackRx Datathon schema."
+        "Balanced speed & accuracy bill extraction using Groq vision models. "
+        "Scout handles batched pages; Maverick refines a few suspicious pages with optional OCR. "
+        "Tuned for ~20–25 seconds per 5 pages on Railway Hobby (8 vCPUs)."
     ),
 )
 
@@ -127,99 +144,37 @@ def guess_mime_type(url: str, content: bytes) -> str:
     return "application/octet-stream"
 
 
-def _resize_for_vision(img: Image.Image, max_dim: int = 650) -> Image.Image:
+def _prepare_vision_image(img: Image.Image) -> Image.Image:
     """
-    Downscale to reduce tokens & latency while keeping table details readable.
-    Slightly smaller than before for better speed on 30+ pages.
+    Resize + enhance for vision model & OCR.
     """
     w, h = img.size
-    scale = max(w, h) / float(max_dim)
-    if scale <= 1.0:
-        return img
-    new_w = int(w / scale)
-    new_h = int(h / scale)
-    return img.resize((new_w, new_h), Image.LANCZOS)
+    scale = max(w, h) / float(RESIZE_MAX_DIM)
+    if scale > 1.0:
+        new_w = int(w / scale)
+        new_h = int(h / scale)
+        img = img.resize((new_w, new_h), Image.LANCZOS)
 
-
-def _enhance_for_vision(img: Image.Image) -> Image.Image:
-    """
-    Light contrast + sharpness boost to help faint numeric columns.
-    """
-    img = ImageEnhance.Contrast(img).enhance(1.4)
-    img = ImageEnhance.Sharpness(img).enhance(1.4)
+    img = ImageEnhance.Contrast(img).enhance(1.5)
+    img = ImageEnhance.Sharpness(img).enhance(1.3)
     return img
 
 
-def _auto_crop_bill_region(img: Image.Image) -> Image.Image:
-    """
-    Auto-crop to the main content/table region.
-
-    Uses simple thresholding on grayscale image to find the bounding box
-    of dark pixels (text/lines). No cv2; only Pillow.
-    """
-    try:
-        gray = img.convert("L")
-        # Map bright background to 0, dark ink to 255
-        bw = gray.point(lambda x: 0 if x > 235 else 255, "1")
-        bbox = bw.getbbox()
-        if not bbox:
-            return img
-
-        left, top, right, bottom = bbox
-        # Add a small margin around detected content
-        margin = int(0.03 * max(img.size))
-        left = max(0, left - margin)
-        top = max(0, top - margin)
-        right = min(img.width, right + margin)
-        bottom = min(img.height, bottom + margin)
-        if right - left < 100 or bottom - top < 100:
-            # Cropped region too small, fallback
-            return img
-        return img.crop((left, top, right, bottom))
-    except Exception:
-        # Never fail because of cropping
-        return img
-
-
-def _compute_image_entropy(img: Image.Image) -> float:
-    """
-    Simple Shannon entropy over grayscale histogram.
-    Used to detect visually dense pages.
-    """
-    gray = img.convert("L")
-    hist = gray.histogram()
-    total = float(sum(hist)) or 1.0
-    entropy = 0.0
-    for c in hist:
-        if c == 0:
-            continue
-        p = c / total
-        entropy -= p * math.log2(p)
-    return float(entropy)
-
-
-def image_to_data_url(img: Image.Image, quality: int = 45) -> str:
+def pil_to_data_url(img: Image.Image, quality: int = JPEG_QUALITY) -> str:
     """
     Convert a PIL Image into a base64 JPEG data URL.
-
-    - Auto-crop content region
-    - Resize to max_dim=850
-    - Slight enhancement
-    - JPEG quality ~60
-    - Ensure < 4 MB per image
+    Assumes img is already resized/enhanced.
     """
-    img = _auto_crop_bill_region(img)
-    img = _resize_for_vision(img, max_dim=850)
-    img = _enhance_for_vision(img)
-
     buf = io.BytesIO()
     img.save(buf, format="JPEG", quality=quality)
     b = buf.getvalue()
 
-    while len(b) > 4 * 1024 * 1024 and quality > 30:
-        quality -= 10
+    # Safety: shrink further if >4MB
+    q = quality
+    while len(b) > 4 * 1024 * 1024 and q > 30:
+        q -= 10
         buf = io.BytesIO()
-        img.save(buf, format="JPEG", quality=quality)
+        img.save(buf, format="JPEG", quality=q)
         b = buf.getvalue()
 
     b64 = base64.b64encode(b).decode("utf-8")
@@ -231,27 +186,13 @@ def document_to_page_infos(url: str, content: bytes) -> List[Dict[str, Any]]:
     Convert the downloaded document into a list of PAGE INFOS:
 
         {
-          "page_index": int,   # 0-based
-          "pil_image": Image.Image,    # cropped, RGB
+          "page_index": int,          # 0-based
           "data_url": "data:image/jpeg;base64,...",
-          "entropy": float
+          "pil_image": <PIL.Image>    # processed image for vision + OCR
         }
     """
     mime = guess_mime_type(url, content)
     page_infos: List[Dict[str, Any]] = []
-
-    def _make_page_info(idx: int, pil_img: Image.Image) -> Dict[str, Any]:
-        # Work on a copy so later mutations don't affect encoding
-        img = pil_img.convert("RGB")
-        cropped = _auto_crop_bill_region(img)
-        entropy = _compute_image_entropy(cropped)
-        data_url = image_to_data_url(cropped)
-        return {
-            "page_index": idx,
-            "pil_image": cropped,   # keep for possible OCR / analysis
-            "data_url": data_url,
-            "entropy": entropy,
-        }
 
     # Single images
     if mime.startswith("image/"):
@@ -262,7 +203,17 @@ def document_to_page_infos(url: str, content: bytes) -> List[Dict[str, Any]]:
                 status_code=400,
                 detail=f"Unable to open image document: {e}",
             )
-        page_infos.append(_make_page_info(0, img))
+
+        processed = _prepare_vision_image(img)
+        data_url = pil_to_data_url(processed)
+
+        page_infos.append(
+            {
+                "page_index": 0,
+                "data_url": data_url,
+                "pil_image": processed,
+            }
+        )
         return page_infos
 
     # PDFs
@@ -281,7 +232,15 @@ def document_to_page_infos(url: str, content: bytes) -> List[Dict[str, Any]]:
 
         for idx, p in enumerate(pages):
             img = p.convert("RGB")
-            page_infos.append(_make_page_info(idx, img))
+            processed = _prepare_vision_image(img)
+            data_url = pil_to_data_url(processed)
+            page_infos.append(
+                {
+                    "page_index": idx,
+                    "data_url": data_url,
+                    "pil_image": processed,
+                }
+            )
         return page_infos
 
     # Fallback: try as image anyway
@@ -293,42 +252,37 @@ def document_to_page_infos(url: str, content: bytes) -> List[Dict[str, Any]]:
             detail=f"Unsupported document type: {mime}",
         )
 
-    page_infos.append(_make_page_info(0, img))
+    processed = _prepare_vision_image(img)
+    data_url = pil_to_data_url(processed)
+    page_infos.append(
+        {
+            "page_index": 0,
+            "data_url": data_url,
+            "pil_image": processed,
+        }
+    )
     return page_infos
 
 
 # ============================================================
-#  Optional OCR Fallback
+#  OCR Helper (Tesseract)
 # ============================================================
 
-def try_ocr_text(img: Image.Image) -> Optional[str]:
+def ocr_page_text(pil_img: Image.Image) -> str:
     """
-    Try to run Tesseract OCR on the given image.
-    Returns a text string or None if OCR is not available or fails.
-
-    This is best-effort and MUST NEVER crash the main pipeline.
+    Run Tesseract OCR on the given image, if enabled/available.
+    Returns plain text (possibly empty).
     """
-    try:
-        import pytesseract  # type: ignore
-    except Exception:
-        return None
+    if not OCR_ENABLED or not OCR_LIB_AVAILABLE:
+        return ""
 
     try:
-        # Crop slightly tighter to reduce background noise
-        cropped = _auto_crop_bill_region(img)
-        text = pytesseract.image_to_string(
-            cropped,
-            config="--psm 6",
-        )
-        text = (text or "").strip()
-        if not text:
-            return None
-        # Limit length so we don't blow up tokens
-        if len(text) > 4000:
-            text = text[:4000]
-        return text
-    except Exception:
-        return None
+        # psm 6: assume a block of text with lines
+        text = pytesseract.image_to_string(pil_img, config="--psm 6")
+        return text.strip()
+    except Exception as e:
+        print(f"[OCR_FAIL] {e}")
+        return ""
 
 
 # ============================================================
@@ -416,7 +370,7 @@ STRICT REQUIREMENTS:
 SYSTEM_PROMPT_MAVERICK = """
 You are a precise hospital BILL ITEM extraction engine.
 
-You will see ONLY ONE page image of a hospital bill, possibly with noisy OCR text.
+You will see ONLY ONE page image of a hospital bill, plus optional OCR text.
 
 Your task:
 
@@ -453,6 +407,38 @@ Rules:
 - If rate is missing but quantity & amount are visible: rate=amount/quantity.
 - If a numeric field is unreadable: set 0.0.
 """
+
+
+def _parse_llm_json(raw_text: str, source_label: str) -> Any:
+    """
+    Robust JSON parsing: strip fences, keep only outermost { ... }.
+    Raises HTTPException if invalid.
+    """
+    raw_text = raw_text.strip()
+
+    # Try direct JSON first
+    try:
+        return json.loads(raw_text)
+    except json.JSONDecodeError:
+        pass
+
+    # Strip markdown fences or extra text around JSON
+    first = raw_text.find("{")
+    last = raw_text.rfind("}")
+    if first != -1 and last != -1 and last > first:
+        json_str = raw_text[first:last + 1]
+        try:
+            return json.loads(json_str)
+        except Exception:
+            raise HTTPException(
+                status_code=500,
+                detail=f"{source_label} response is not valid JSON: {raw_text[:200]}",
+            )
+    else:
+        raise HTTPException(
+            status_code=500,
+            detail=f"{source_label} response is not valid JSON: {raw_text[:200]}",
+        )
 
 
 def call_groq_for_batch(
@@ -532,28 +518,8 @@ For EACH batch page i (1-based), you must:
         output_tokens=output_tokens,
     )
 
-    raw_text = response.output_text.strip()
-
-    # Robust JSON parsing (strip fences if any)
-    try:
-        parsed = json.loads(raw_text)
-    except json.JSONDecodeError:
-        first = raw_text.find("{")
-        last = raw_text.rfind("}")
-        if first != -1 and last != -1 and last > first:
-            json_str = raw_text[first:last + 1]
-            try:
-                parsed = json.loads(json_str)
-            except Exception:
-                raise HTTPException(
-                    status_code=500,
-                    detail=f"Model response is not valid JSON: {raw_text[:200]}",
-                )
-        else:
-            raise HTTPException(
-                status_code=500,
-                detail=f"Model response is not valid JSON: {raw_text[:200]}",
-            )
+    raw_text = response.output_text
+    parsed = _parse_llm_json(raw_text, source_label="Scout")
 
     if isinstance(parsed, dict) and "pagewise_line_items" in parsed:
         raw_pages = parsed.get("pagewise_line_items", []) or []
@@ -562,7 +528,7 @@ For EACH batch page i (1-based), you must:
     else:
         raise HTTPException(
             status_code=500,
-            detail="Model JSON for batch does not contain 'pagewise_line_items' list.",
+            detail="Scout JSON for batch does not contain 'pagewise_line_items' list.",
         )
 
     # Guarantee one page object per input page in this batch
@@ -582,15 +548,13 @@ For EACH batch page i (1-based), you must:
 
 def call_groq_for_single_page_maverick(
     page_info: Dict[str, Any],
-    ocr_text: Optional[str] = None,
+    ocr_text: str = "",
 ) -> Tuple[Dict[str, Any], TokenUsage]:
     """
-    Single-page refinement using Maverick.
+    Single-page refinement using Maverick, optionally with OCR text.
     Returns:
         - raw_page: one dict with page_no="1", page_type, bill_items
         - token_usage: TokenUsage for this Maverick call
-
-    Any JSON/LLM error is raised to the caller, which will fall back safely.
     """
     user_content: List[Dict[str, Any]] = []
 
@@ -599,13 +563,19 @@ def call_groq_for_single_page_maverick(
             {
                 "type": "input_text",
                 "text": (
-                    "NOISY OCR TEXT from this page, may contain errors. "
-                    "Use as a hint to locate line items; do NOT trust it blindly:\n"
-                    + ocr_text
+                    "Below is OCR text for this page. Use it ONLY to help you read "
+                    "blurred numbers, but always respect the visual layout.\n\n"
+                    f"OCR_TEXT_START\n{ocr_text}\nOCR_TEXT_END"
                 ),
             }
         )
 
+    user_content.append(
+        {
+            "type": "input_text",
+            "text": "This is a single hospital bill page. Extract all charge line items only.",
+        }
+    )
     user_content.append(
         {
             "type": "input_image",
@@ -648,28 +618,8 @@ def call_groq_for_single_page_maverick(
         output_tokens=output_tokens,
     )
 
-    raw_text = response.output_text.strip()
-
-    # Robust JSON parsing, same pattern
-    try:
-        parsed = json.loads(raw_text)
-    except json.JSONDecodeError:
-        first = raw_text.find("{")
-        last = raw_text.rfind("}")
-        if first != -1 and last != -1 and last > first:
-            json_str = raw_text[first:last + 1]
-            try:
-                parsed = json.loads(json_str)
-            except Exception:
-                raise HTTPException(
-                    status_code=500,
-                    detail=f"Maverick response is not valid JSON: {raw_text[:200]}",
-                )
-        else:
-            raise HTTPException(
-                status_code=500,
-                detail=f"Maverick response is not valid JSON: {raw_text[:200]}",
-            )
+    raw_text = response.output_text
+    parsed = _parse_llm_json(raw_text, source_label="Maverick")
 
     if isinstance(parsed, dict) and "pagewise_line_items" in parsed:
         raw_pages = parsed.get("pagewise_line_items", []) or []
@@ -684,10 +634,9 @@ def call_groq_for_single_page_maverick(
     if not raw_pages:
         raise HTTPException(
             status_code=500,
-            detail="Maverick JSON returned empty pagewise_line_items.",
+            detail="Maverick JSON returned empty 'pagewise_line_items'.",
         )
 
-    # Use first page only (this call is strictly single-page)
     raw_page = raw_pages[0]
     return raw_page, token_usage
 
@@ -720,7 +669,7 @@ def clean_page_dict(page_dict: Dict[str, Any]) -> Dict[str, Any]:
     fail when numeric fields are null/empty/etc.
 
     IMPORTANT: We DO NOT dedupe within a page here – multiple identical rows
-    (e.g. many IP CONSULTATION CHARGES) must be preserved as separate items.
+    must be preserved as separate items.
     """
     bill_items = page_dict.get("bill_items", []) or []
     cleaned_items: List[Dict[str, Any]] = []
@@ -860,13 +809,21 @@ def compute_grand_total_amount(pages: List[PageItems]) -> float:
 @app.get("/extract-bill-data")
 def health_check():
     return {
-        "message": "Health OK. Use POST /extract-bill-data with JSON body "
-                   '{"document": "<public image/PDF URL>"} to extract bill data.'
+        "message": (
+            "Health OK. Use POST /extract-bill-data with JSON body "
+            '{"document": "<public image/PDF URL>"} to extract bill data.'
+        ),
+        "balanced_mode": True,
+        "resize_max_dim": RESIZE_MAX_DIM,
+        "jpeg_quality": JPEG_QUALITY,
+        "max_images_per_request": MAX_IMAGES_PER_REQUEST,
+        "max_maverick_pages": MAX_MAVERICK_PAGES,
+        "ocr_enabled": OCR_ENABLED and OCR_LIB_AVAILABLE,
     }
 
 
 # ============================================================
-#  Main Datathon Endpoint (POST)
+#  Main Datathon Endpoint (POST) – Balanced Mode
 # ============================================================
 
 @app.post("/extract-bill-data", response_model=ExtractBillDataResponse)
@@ -877,7 +834,7 @@ def extract_bill_data(req: ExtractBillDataRequest):
     # 1. Download document
     content = download_document(url_str)
 
-    # 2. Convert to per-page infos (image → data_url, entropy, etc.)
+    # 2. Convert to per-page infos (image → data_url + PIL)
     page_infos = document_to_page_infos(url_str, content)
     num_pages = len(page_infos)
 
@@ -931,47 +888,24 @@ def extract_bill_data(req: ExtractBillDataRequest):
             message="Model did not return any page items.",
         )
 
-    # 4. Select suspicious pages for Maverick refinement
-    suspicious_candidates: List[Tuple[int, int]] = []  # (score, index)
-
+    # 4. Maverick refinement on suspicious pages (best-effort, never crashes)
+    suspicious_indices: List[int] = []
     for idx, p in enumerate(all_pages):
-        num_items = len(p.bill_items)
-        entropy = float(page_infos[idx].get("entropy", 0.0))
-        page_type = p.page_type.strip().lower()
+        if len(p.bill_items) < MIN_ITEMS_FOR_OK:
+            suspicious_indices.append(idx)
+        elif p.page_type.strip().lower() == "final bill":
+            suspicious_indices.append(idx)
 
-        score = 0
-        if num_items <= 2:
-            score += 4
-        elif num_items <= 5:
-            score += 3
-        elif num_items <= 10:
-            score += 1
+    suspicious_indices = suspicious_indices[:MAX_MAVERICK_PAGES]
 
-        if "final" in page_type:
-            score += 4
-        if entropy > 4.5:
-            score += 1
-
-        if score > 0:
-            suspicious_candidates.append((score, idx))
-
-    # Highest score first, cap to MAX_MAVERICK_PAGES
-    suspicious_candidates.sort(reverse=True)
-    suspicious_indices = [idx for _, idx in suspicious_candidates[:MAX_MAVERICK_PAGES]]
-
-    # 5. Maverick refinement on suspicious pages (best-effort, never crashes)
     for idx in suspicious_indices:
-        try:
-            img_for_ocr = page_infos[idx].get("pil_image")
-            ocr_text = None
-            # Use OCR only when entropy is high and Scout extracted few items
-            if img_for_ocr is not None:
-                if page_infos[idx].get("entropy", 0.0) > 4.5 and len(all_pages[idx].bill_items) <= 10:
-                    ocr_text = try_ocr_text(img_for_ocr)
+        pi = page_infos[idx]
+        ocr_txt = ocr_page_text(pi["pil_image"]) if OCR_ENABLED and OCR_LIB_AVAILABLE else ""
 
+        try:
             raw_page_mav, usage_mav = call_groq_for_single_page_maverick(
-                page_infos[idx],
-                ocr_text=None,
+                pi,
+                ocr_text=ocr_txt,
             )
         except HTTPException as e:
             print(f"[MAVERICK_SKIP] page={idx+1} reason={e.detail}")
@@ -988,10 +922,10 @@ def extract_bill_data(req: ExtractBillDataRequest):
         refined_page = reconcile_page_items(raw_page_mav)
         all_pages[idx] = refined_page
 
-    # 6. Enrich missing numeric fields using global patterns
+    # 5. Enrich missing numeric fields using global patterns
     all_pages = enrich_from_patterns(all_pages)
 
-    # 7. Aggregate
+    # 6. Aggregate
     data = aggregate_all_pages(all_pages)
 
     token_usage = TokenUsage(
@@ -1000,7 +934,7 @@ def extract_bill_data(req: ExtractBillDataRequest):
         output_tokens=output_tokens,
     )
 
-    # 8. Logging
+    # 7. Logging
     grand_total = compute_grand_total_amount(all_pages)
     elapsed = time.time() - start_time
 
