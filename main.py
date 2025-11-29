@@ -1,3 +1,4 @@
+# main.py
 import base64
 import io
 import json
@@ -15,7 +16,7 @@ from PIL import Image
 from openai import OpenAI
 
 # ============================================================
-#  Groq Client
+#  Groq Client (OpenAI-compatible)
 # ============================================================
 
 client = OpenAI(
@@ -23,14 +24,18 @@ client = OpenAI(
     base_url="https://api.groq.com/openai/v1",
 )
 
-# Fast + cheap
-MODEL_FAST = "meta-llama/llama-4-scout-17b-16e-instruct"
-# More accurate, used only on Final Bill pages
-MODEL_ACCURATE = "meta-llama/llama-4-maverick-17b-128e-instruct"
+# Balanced mode: fast + good accuracy
+GROQ_VISION_MODEL_ID = os.environ.get(
+    "GROQ_VISION_MODEL_ID",
+    "meta-llama/llama-4-scout-17b-16e-instruct",
+)
+
+# Groq Vision limit: MAX 5 images per request
+MAX_IMAGES_PER_REQUEST = 5
 
 
 # ============================================================
-#  Schemas (STRICT REQUIREMENTS FROM DATATHON)
+#  Pydantic Schemas – EXACTLY as per Datathon spec
 # ============================================================
 
 class BillItem(BaseModel):
@@ -42,7 +47,7 @@ class BillItem(BaseModel):
 
 class PageItems(BaseModel):
     page_no: str
-    page_type: str
+    page_type: str  # "Bill Detail" | "Final Bill" | "Pharmacy"
     bill_items: List[BillItem]
 
 
@@ -75,291 +80,460 @@ class ExtractBillDataResponse(BaseModel):
 app = FastAPI(
     title="Bajaj Datathon Bill Extraction API",
     version="5.0.0",
+    description=(
+        "Extracts line items from multi-page bill/invoice documents using "
+        "Groq vision models with batching (max 5 images per request). "
+        "Implements the exact HackRx Datathon schema and is tuned for "
+        "high accuracy while staying under time limits on large PDFs."
+    ),
 )
 
 
 # ============================================================
-#  Helpers — Download + Convert
+#  Helpers – Download & Convert Documents
 # ============================================================
 
 def download_document(url: str) -> bytes:
+    """
+    Download the document from the given URL.
+    Supports:
+    - Direct image URLs (png, jpg, jpeg, webp, etc.)
+    - Direct PDF URLs
+    - Public file links that resolve to the above
+    """
     try:
-        r = requests.get(url, timeout=40)
-        r.raise_for_status()
-        return r.content
+        resp = requests.get(url, timeout=40)
+        resp.raise_for_status()
+        return resp.content
     except Exception as e:
-        raise HTTPException(400, f"Failed to download document: {e}")
+        raise HTTPException(
+            status_code=400,
+            detail=f"Failed to download document: {e}",
+        )
 
 
-def guess_mime(url: str, content: bytes) -> str:
+def guess_mime_type(url: str, content: bytes) -> str:
+    """
+    Guess mime type based on URL extension or magic bytes.
+    """
     mime, _ = mimetypes.guess_type(url)
     if mime:
         return mime
+
     if content[:4] == b"%PDF":
         return "application/pdf"
+
     return "application/octet-stream"
 
 
-def resize_for_llm(img: Image.Image) -> Image.Image:
-    # Smaller max_dim → fewer tokens → faster
-    max_dim = 1100
+def _resize_for_vision(img: Image.Image, max_dim: int = 1100) -> Image.Image:
+    """
+    Downscale to reduce tokens & latency while keeping table details readable.
+    Smaller max_dim → faster + cheaper, still fine for Scout.
+    """
     w, h = img.size
-    s = max(w, h) / max_dim
-    if s <= 1:
+    scale = max(w, h) / float(max_dim)
+    if scale <= 1.0:
         return img
-    return img.resize((int(w / s), int(h / s)), Image.LANCZOS)
+    new_w = int(w / scale)
+    new_h = int(h / scale)
+    return img.resize((new_w, new_h), Image.LANCZOS)
 
 
-def img_to_data_url(img: Image.Image) -> str:
-    img = resize_for_llm(img)
+def image_to_data_url(img: Image.Image, quality: int = 60) -> str:
+    """
+    Convert a PIL Image into a base64 JPEG data URL.
+
+    - Resize to max_dim=1100
+    - JPEG quality ~60 (enough for text to be readable for the model)
+    - Ensure < 4 MB per image as per Groq base64 limits.
+    """
+    img = _resize_for_vision(img, max_dim=1100)
+
     buf = io.BytesIO()
-    img.save(buf, "JPEG", quality=60)
-    data = buf.getvalue()
+    img.save(buf, format="JPEG", quality=quality)
+    b = buf.getvalue()
 
-    # Safety: keep below ~4MB per image for base64
-    while len(data) > 4 * 1024 * 1024:
+    while len(b) > 4 * 1024 * 1024 and quality > 30:
+        quality -= 10
         buf = io.BytesIO()
-        img.save(buf, "JPEG", quality=40)
-        data = buf.getvalue()
+        img.save(buf, format="JPEG", quality=quality)
+        b = buf.getvalue()
 
-    b64 = base64.b64encode(data).decode("utf-8")
+    b64 = base64.b64encode(b).decode("utf-8")
     return f"data:image/jpeg;base64,{b64}"
 
 
-def document_to_images(url: str, content: bytes) -> List[str]:
-    mime = guess_mime(url, content)
-    pages: List[str] = []
+def document_to_page_infos(url: str, content: bytes) -> List[Dict[str, Any]]:
+    """
+    Convert the downloaded document into a list of PAGE INFOS:
 
+        {
+          "page_index": int,   # 0-based
+          "data_url": "data:image/jpeg;base64,..."
+        }
+
+    - If image: one page.
+    - If PDF: one image per page.
+    OCR is NOT used for speed.
+    """
+    mime = guess_mime_type(url, content)
+    page_infos: List[Dict[str, Any]] = []
+
+    # Single images
     if mime.startswith("image/"):
-        img = Image.open(io.BytesIO(content)).convert("RGB")
-        pages.append(img_to_data_url(img))
-        return pages
-
-    if mime == "application/pdf":
         try:
-            pdf_pages = convert_from_bytes(content)
+            img = Image.open(io.BytesIO(content)).convert("RGB")
         except Exception as e:
             raise HTTPException(
-                400,
-                f"Unable to convert PDF to images. Ensure poppler is installed. Error: {e}",
+                status_code=400,
+                detail=f"Unable to open image document: {e}",
             )
-        for p in pdf_pages:
-            pages.append(img_to_data_url(p.convert("RGB")))
-        return pages
 
-    # fallback as image
+        page_infos.append(
+            {
+                "page_index": 0,
+                "data_url": image_to_data_url(img),
+            }
+        )
+        return page_infos
+
+    # PDFs
+    if mime == "application/pdf":
+        try:
+            pages = convert_from_bytes(content)
+        except Exception as e:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Unable to convert PDF to images. "
+                    "Ensure poppler is installed and available in PATH. "
+                    f"Error: {e}"
+                ),
+            )
+
+        for idx, p in enumerate(pages):
+            img = p.convert("RGB")
+            page_infos.append(
+                {
+                    "page_index": idx,
+                    "data_url": image_to_data_url(img),
+                }
+            )
+        return page_infos
+
+    # Fallback: try as image anyway
     try:
         img = Image.open(io.BytesIO(content)).convert("RGB")
-        pages.append(img_to_data_url(img))
-        return pages
     except Exception:
-        raise HTTPException(400, f"Unsupported file format: {mime}")
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported document type: {mime}",
+        )
+
+    page_infos.append(
+        {
+            "page_index": 0,
+            "data_url": image_to_data_url(img),
+        }
+    )
+    return page_infos
 
 
 # ============================================================
-#  PROMPTS — Optimized for JSON ONLY
+#  LLM Prompt – Multi-page (batched), strict JSON, no double-count
 # ============================================================
 
 SYSTEM_PROMPT = """
-You extract line items from MULTI-PAGE hospital bills.
+You are an expert medical BILL ITEM extraction engine for hospital bills.
 
-RULES:
-- Output STRICT JSON ONLY.
-- NO markdown, NO ```json, NO headings, NO explanations.
-- NEVER output totals, sub-totals, tax rows, headers.
-- NEVER duplicate the same item across pages.
-- item_amount must match the row amount printed in the bill.
-- If qty missing → qty=1 and rate=item_amount.
-- If rate missing → rate=item_amount/qty.
-- Numeric values must be JSON numbers.
-- page_no as STRING, starting from "1".
-"""
+Your goals:
 
-USER_PROMPT_GLOBAL = """
-You will receive several page images in order.
-For EACH page:
-- Identify page_type ∈ {"Bill Detail", "Final Bill", "Pharmacy"}.
-- Extract bill_items ONLY from that page.
-- Do NOT copy summary rows from Final Bill pages.
-- Do NOT double count items also present in detail pages.
+1) Capture EVERY genuine line item from the tables (high recall).
+2) Do NOT double-count or duplicate the same line item (no over-count).
+3) Make the sum of all `item_amount` values across all pages as close as possible
+   to the FINAL TOTAL printed in the bill.
+4) Respect the exact JSON structure required by the HackRx Datathon.
 
-Output ONE strict JSON object:
+---------------- DOCUMENT & TERMINOLOGY ----------------
+
+You will receive a *subset* of pages from a hospital bill:
+    Page 1, Page 2, ..., Page K (within this batch).
+
+Each page may contain:
+- Headers (hospital name, patient details, dates).
+- One or more TABLES of charges:
+    * Lab tests / Investigations
+    * Radiology / Imaging
+    * Pharmacy / Medicines
+    * Bed / Room / ICU charges
+    * Operation theatre / Procedure charges
+    * Consultation / Doctor visit charges
+    * Nursing / Maintenance / Service charges
+- Sub-total rows per section.
+- Final summary rows such as:
+    "Total", "Sub Total", "Grand Total", "Net Amount Payable",
+    "Amount Received", "Balance", "Discount", "GST", "CGST", "SGST", etc.
+
+Definitions:
+- A "LINE ITEM" is a single concrete charge row with a meaningful description
+  and a numeric amount.
+
+For each LINE ITEM, you must output:
+    * item_name:    description of the charge
+    * item_quantity: quantity / days / units
+    * item_rate:    rate per unit
+    * item_amount:  net amount for that item AFTER discounts, BEFORE tax
+      (exact number printed in that row for that item when possible)
+
+Section titles and totals:
+- Titles like "PATHOLOGY", "RADIOLOGY", "PHARMACY CHARGES", "BED CHARGES",
+  "CONSULTATION", etc. are NOT line items.
+- Rows like "Total PATHOLOGY", "LAB TOTAL", "PHARMACY TOTAL",
+  "SUB TOTAL", "TOTAL", "GRAND TOTAL", "NET AMOUNT PAYABLE",
+  "ROUND OFF", "DISCOUNT", "GST", "CGST", "SGST", "IGST" are NOT items.
+You MUST NOT output these rows as bill_items.
+
+---------------- CRITICAL RULES ----------------
+
+1. PROCESS ONLY THE PAGES IN THIS BATCH
+   - You see K page images in order for this batch.
+   - For each page i in this batch, you must output data for THAT page only.
+
+2. DO NOT MISS ITEMS
+   - For every visible row with description + amount in a table, output one bill_items entry.
+   - Skip pure headers/titles and pure total/summary rows.
+
+3. DO NOT DOUBLE-COUNT
+   - If an item is shown as a detailed line item and then repeated as a section total
+     or final total, ONLY output the detailed line, not the total.
+   - Do NOT create two JSON entries for a single visual table row.
+
+4. NUMERIC FIELDS
+   - item_quantity: from "Qty", "QTY", "No. of Days", etc.
+   - item_rate:     from "Rate", "RATE", "Charges per day", etc.
+   - item_amount:   from "Amount", "Net Amt", "Total", etc.
+   Rules:
+   - If quantity is missing but amount is present:
+         quantity = 1.0
+         rate = amount
+   - If rate is missing but quantity and amount are present:
+         rate = amount / quantity (rounded sensibly).
+   - If any numeric field is blank/unreadable:
+         use 0.0 (not null / empty string).
+   - Use numeric JSON values only (e.g. 1200.5, not "1,200.5").
+
+5. PAGE TYPE
+   For each page in this batch, set:
+       page_type = "Bill Detail" | "Final Bill" | "Pharmacy"
+
+   - "Bill Detail" → general pages with mixed charges tables.
+   - "Pharmacy"    → pages dominated by medicines/drugs.
+   - "Final Bill"  → summary pages with totals and sometimes compressed lines.
+
+Choose the most appropriate label per page.
+
+---------------- OUTPUT STRUCTURE (PER BATCH) ----------------
+
+You MUST output ONE SINGLE JSON OBJECT:
+
 {
   "pagewise_line_items": [
-    { "page_no": "1", "page_type": "...", "bill_items": [...] },
-    { "page_no": "2", "page_type": "...", "bill_items": [...] }
+    {
+      "page_no": "1",
+      "page_type": "Bill Detail" | "Final Bill" | "Pharmacy",
+      "bill_items": [
+        {
+          "item_name": "<string>",
+          "item_amount": <float>,
+          "item_rate": <float>,
+          "item_quantity": <float>
+        }
+      ]
+    },
+    {
+      "page_no": "2",
+      "page_type": "Bill Detail" | "Final Bill" | "Pharmacy",
+      "bill_items": [ ... ]
+    }
   ],
-  "total_item_count": <int>
+  "total_item_count": <integer>
 }
+
+Where:
+- page_no is the 1-based index WITHIN THIS BATCH (as a STRING).
+- There must be exactly one object in pagewise_line_items for EACH page in this batch.
+- bill_items can be [] if a page has no charge lines.
+- total_item_count is the TOTAL number of items across ALL bill_items
+  on ALL pages in this batch.
+
+STRICT REQUIREMENTS:
+- Do NOT wrap the JSON in ``` or any markdown.
+- Do NOT add any keys other than pagewise_line_items and total_item_count
+  at the top level.
+- Do NOT add extra keys inside page objects or item objects.
+- Do NOT output totals, sub-totals, tax rows, or duplicate summary lines
+  as bill_items.
 """
 
-USER_PROMPT_SINGLE = """
-You are re-checking ONLY ONE PAGE (usually a Final Bill page).
-Extract ONLY real item rows on THIS PAGE.
-Do NOT output totals, taxes, discounts, or repeated summary rows.
-Output STRICT JSON ONLY for this page, with shape:
-{
-  "page_no": "<string>",
-  "page_type": "Bill Detail" | "Final Bill" | "Pharmacy",
-  "bill_items": [
-    { "item_name": "...", "item_amount": <float>, "item_rate": <float>, "item_quantity": <float> }
-  ]
-}
+
+def call_groq_for_batch(
+    batch_page_infos: List[Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], TokenUsage]:
+    """
+    Single Groq Vision call for a batch of pages (size <= MAX_IMAGES_PER_REQUEST).
+    Returns:
+        - raw_pages: list of per-page dicts (page_no, page_type, bill_items)
+        - token_usage: TokenUsage for this batch
+    """
+    num_batch_pages = len(batch_page_infos)
+
+    user_text = f"""
+You are given a BATCH of {num_batch_pages} page image(s) from a hospital bill.
+
+The images will be provided in order for this batch:
+    first image is batch page 1, second is batch page 2, ..., up to batch page {num_batch_pages}.
+
+For EACH batch page i (1-based), you must:
+- Set page_no = "<i>" (as a string)
+- Choose page_type from: "Bill Detail", "Final Bill", "Pharmacy"
+- Extract bill_items ONLY for that page.
+
+Then return ONE combined JSON object for this batch, matching exactly the
+structure described in the system instructions.
 """
 
+    # Build content list: one user message with text + all images in this batch
+    user_content: List[Dict[str, Any]] = [
+        {
+            "type": "input_text",
+            "text": user_text.strip(),
+        }
+    ]
 
-# ============================================================
-#  Groq Call Helpers
-# ============================================================
+    for idx, info in enumerate(batch_page_infos):
+        batch_page_no = idx + 1
+        user_content.append(
+            {
+                "type": "input_text",
+                "text": f"BATCH PAGE {batch_page_no} IMAGE BELOW.",
+            }
+        )
+        user_content.append(
+            {
+                "type": "input_image",
+                "image_url": info["data_url"],
+                "detail": "auto",
+            }
+        )
 
-def parse_json_robust(raw: str) -> dict:
-    """
-    Robustly extract a JSON object from a possibly noisy string.
-    """
-    raw = raw.strip()
-    # Remove typical markdown fences if present
-    if raw.startswith("```"):
-        # Strip leading/trailing fences
-        raw = raw.strip("`")
-        # Sometimes still starts with json\n
-        if raw.lower().startswith("json"):
-            raw = raw[4:].lstrip()
-
-    # Direct attempt
     try:
-        return json.loads(raw)
-    except Exception:
-        pass
-
-    # Fallback: take substring between first '{' and last '}'
-    first = raw.find("{")
-    last = raw.rfind("}")
-    if first != -1 and last != -1 and last > first:
-        snippet = raw[first:last + 1]
-        try:
-            return json.loads(snippet)
-        except Exception:
-            raise HTTPException(500, f"Model response is not valid JSON: {raw[:200]}")
-    raise HTTPException(500, f"Model response is not valid JSON: {raw[:200]}")
-
-
-def groq_call(model: str, system: str, user_blocks: List[dict]) -> Tuple[dict, TokenUsage]:
-    try:
-        resp = client.responses.create(
-            model=model,
+        response = client.responses.create(
+            model=GROQ_VISION_MODEL_ID,
             input=[
                 {
                     "role": "system",
-                    "content": [{"type": "input_text", "text": system}],
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": SYSTEM_PROMPT.strip(),
+                        }
+                    ],
                 },
                 {
                     "role": "user",
-                    "content": user_blocks,
+                    "content": user_content,
                 },
             ],
         )
     except Exception as e:
-        raise HTTPException(503, f"Groq API error: {e}")
+        raise HTTPException(
+            status_code=503,
+            detail=f"Groq API error: {e}",
+        )
 
-    usage = getattr(resp, "usage", None)
-    tu = TokenUsage(
-        total_tokens=int(getattr(usage, "total_tokens", 0) or 0),
-        input_tokens=int(getattr(usage, "input_tokens", 0) or 0),
-        output_tokens=int(getattr(usage, "output_tokens", 0) or 0),
+    usage = getattr(response, "usage", None)
+    if usage is not None:
+        total_tokens = int(getattr(usage, "total_tokens", 0) or 0)
+        input_tokens = int(getattr(usage, "input_tokens", 0) or 0)
+        output_tokens = int(getattr(usage, "output_tokens", 0) or 0)
+    else:
+        total_tokens = input_tokens = output_tokens = 0
+
+    token_usage = TokenUsage(
+        total_tokens=total_tokens,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
     )
 
-    raw = resp.output_text.strip()
-    parsed = parse_json_robust(raw)
-    return parsed, tu
+    raw_text = response.output_text.strip()
 
+    # Robust JSON parsing (strip ```json fences etc. if present)
+    try:
+        parsed = json.loads(raw_text)
+    except json.JSONDecodeError:
+        first = raw_text.find("{")
+        last = raw_text.rfind("}")
+        if first != -1 and last != -1 and last > first:
+            json_str = raw_text[first:last + 1]
+            try:
+                parsed = json.loads(json_str)
+            except Exception:
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Model response is not valid JSON: {raw_text[:200]}",
+                )
+        else:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Model response is not valid JSON: {raw_text[:200]}",
+            )
 
-def normalize_pages_from_fast(parsed: Any, num_pages: int) -> Dict[int, Dict[str, Any]]:
-    """
-    Normalize the FAST (Scout) model output into a dict:
-        index -> {page_no, page_type, bill_items}
-    """
-
+    # Normalise: extract list of pages from batch JSON
     if isinstance(parsed, dict) and "pagewise_line_items" in parsed:
-        raw_pages = parsed.get("pagewise_line_items") or []
+        raw_pages = parsed.get("pagewise_line_items", []) or []
     elif isinstance(parsed, list):
         raw_pages = parsed
     else:
-        raw_pages = []
+        raise HTTPException(
+            status_code=500,
+            detail="Model JSON for batch does not contain 'pagewise_line_items' list.",
+        )
 
-    pages_dict: Dict[int, Dict[str, Any]] = {
-        i: {"page_no": str(i + 1), "page_type": "Bill Detail", "bill_items": []}
-        for i in range(num_pages)
-    }
+    # Guarantee one page object per input page in this batch
+    if len(raw_pages) < num_batch_pages:
+        for idx in range(len(raw_pages), num_batch_pages):
+            raw_pages.append(
+                {
+                    "page_no": str(idx + 1),
+                    "page_type": "Bill Detail",
+                    "bill_items": [],
+                }
+            )
 
-    for p in raw_pages:
-        if not isinstance(p, dict):
-            continue
+    # If model returned extra pages, ignore extras
+    raw_pages = raw_pages[:num_batch_pages]
 
-        page_no_raw = p.get("page_no", None)
-        idx = None
-        try:
-            idx = int(str(page_no_raw).strip()) - 1
-        except Exception:
-            # ignore invalid page_no
-            continue
-
-        if idx is None or idx < 0 or idx >= num_pages:
-            continue
-
-        pages_dict[idx] = p
-
-    return pages_dict
-
-
-def normalize_single_page_output(parsed: Any, page_index: int) -> Dict[str, Any]:
-    """
-    Normalize ACCURATE (Maverick) output for a single page into a page dict.
-    If it returns a multi-page object, pick appropriate page.
-    """
-    default_page_no = str(page_index + 1)
-
-    if isinstance(parsed, dict):
-        if "pagewise_line_items" in parsed:
-            candidates = parsed.get("pagewise_line_items") or []
-            chosen = None
-            # Prefer page with matching page_no
-            for p in candidates:
-                if isinstance(p, dict) and str(p.get("page_no")) == default_page_no:
-                    chosen = p
-                    break
-            if chosen is None and candidates:
-                chosen = candidates[0]
-            page = chosen or {}
-        else:
-            page = parsed
-    elif isinstance(parsed, list):
-        page = parsed[0] if parsed else {}
-    else:
-        page = {}
-
-    # Enforce required shape
-    if not isinstance(page, dict):
-        page = {}
-    page.setdefault("page_no", default_page_no)
-    page.setdefault("page_type", "Final Bill")
-    page.setdefault("bill_items", [])
-
-    return page
+    return raw_pages, token_usage
 
 
 # ============================================================
-#  Cleaning
+#  Reconcile, Clean & Aggregate
 # ============================================================
 
-def norm_num(x: Any) -> float:
+def _coerce_number(x: Any) -> float:
+    """
+    Coerce a potentially messy numeric value (None, "", "—", etc.) to float.
+    """
     if x is None:
         return 0.0
     if isinstance(x, (int, float)):
         return float(x)
     if isinstance(x, str):
-        s = x.replace(",", "").strip()
-        if s in ["", "-", "—", "NA", "N/A"]:
+        s = x.strip()
+        if s == "" or s in {"-", "—", "NA", "N/A"}:
             return 0.0
+        s = s.replace(",", "")
         try:
             return float(s)
         except Exception:
@@ -367,229 +541,279 @@ def norm_num(x: Any) -> float:
     return 0.0
 
 
-def clean_page_dict(p: Dict[str, Any]) -> Dict[str, Any]:
+def clean_page_dict(page_dict: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Pre-clean and dedupe within a single page dict.
+    Pre-clean the raw JSON dict from the model so that Pydantic parsing will not
+    fail when numeric fields are null/empty/etc.
+    Also performs within-page exact duplicate removal (same name + numbers).
     """
-    items: List[Dict[str, Any]] = []
-    seen: Set[Tuple[str, float, float, float]] = set()
+    bill_items = page_dict.get("bill_items", []) or []
+    cleaned_items: List[Dict[str, Any]] = []
 
-    for it in (p.get("bill_items") or []):
-        if not isinstance(it, dict):
+    seen_keys: Set[Tuple[str, float, float, float]] = set()
+
+    for item in bill_items:
+        if not isinstance(item, dict):
             continue
 
-        name = str(it.get("item_name", "")).strip()
-        amt = norm_num(it.get("item_amount"))
-        rate = norm_num(it.get("item_rate"))
-        qty = norm_num(it.get("item_quantity"))
+        name = str(item.get("item_name", "")).strip()
+        amount = _coerce_number(item.get("item_amount"))
+        rate = _coerce_number(item.get("item_rate"))
+        qty = _coerce_number(item.get("item_quantity"))
 
-        key = (name.lower(), round(amt, 2), round(rate, 4), round(qty, 4))
-        if key in seen:
+        key = (
+            name.lower(),
+            round(amount, 2),
+            round(rate, 4),
+            round(qty, 4),
+        )
+        if key in seen_keys:
+            # Drop exact duplicates on the same page
             continue
-        seen.add(key)
+        seen_keys.add(key)
 
-        items.append(
+        cleaned_items.append(
             {
                 "item_name": name,
-                "item_amount": amt,
+                "item_amount": amount,
                 "item_rate": rate,
                 "item_quantity": qty,
             }
         )
 
     return {
-        "page_no": str(p.get("page_no", "")),
-        "page_type": str(p.get("page_type", "Bill Detail")),
-        "bill_items": items,
+        "page_no": str(page_dict.get("page_no", "")),
+        "page_type": str(page_dict.get("page_type", "Bill Detail")),
+        "bill_items": cleaned_items,
     }
 
 
-def fix_math(page: PageItems) -> PageItems:
-    EPS = 0.02
-    for it in page.bill_items:
-        amt = float(it.item_amount)
-        rate = float(it.item_rate)
-        qty = float(it.item_quantity)
+def reconcile_page_items(page_dict: Dict[str, Any]) -> PageItems:
+    """
+    Validate and normalize a single page's JSON dict into PageItems.
+    Fix small inconsistencies between rate, qty and amount.
+    """
+    cleaned = clean_page_dict(page_dict)
 
-        if rate > 0 and qty > 0:
-            if abs(rate * qty - amt) > EPS:
-                it.item_amount = round(rate * qty, 2)
-        elif qty > 0 and amt > 0:
-            it.item_rate = round(amt / qty, 4)
-        elif amt > 0:
-            it.item_quantity = 1.0
-            it.item_rate = round(amt, 2)
-    return page
+    try:
+        page_items = PageItems(**cleaned)
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Model JSON does not match expected schema: {e}",
+        )
+
+    EPS = 0.01
+    for item in page_items.bill_items:
+        amount = float(item.item_amount)
+        rate = float(item.item_rate)
+        qty = float(item.item_quantity)
+
+        if rate and qty:
+            computed = rate * qty
+            if math.isfinite(computed) and abs(computed - amount) > EPS:
+                # Trust arithmetic over noisy OCR when mismatch is large
+                item.item_amount = round(computed, 2)
+        elif amount and qty and qty != 0:
+            computed_rate = amount / qty
+            item.item_rate = round(computed_rate, 4)
+        elif amount and (not qty or qty == 0):
+            item.item_quantity = 1.0
+            item.item_rate = round(amount, 2)
+
+    return page_items
 
 
-def dedupe_across_pages(pages: List[PageItems]) -> List[PageItems]:
+def dedupe_all_pages(pages: List[PageItems]) -> List[PageItems]:
     """
     De-duplicate clearly repeated items across pages.
+
+    Items with identical:
+        (page_type, normalized_name, rate, qty, amount)
+    are treated as duplicates; we keep only the first occurrence.
+
+    This protects against double-counting when summary pages re-list items
+    already fully detailed elsewhere.
     """
     seen: Set[Tuple[str, str, float, float, float]] = set()
-    out: List[PageItems] = []
+    deduped_pages: List[PageItems] = []
 
     for p in pages:
         new_items: List[BillItem] = []
-        for it in p.bill_items:
+        for item in p.bill_items:
             key = (
                 p.page_type.strip().lower(),
-                it.item_name.strip().lower(),
-                round(float(it.item_rate), 4),
-                round(float(it.item_quantity), 4),
-                round(float(it.item_amount), 2),
+                item.item_name.strip().lower(),
+                round(float(item.item_rate), 4),
+                round(float(item.item_quantity), 4),
+                round(float(item.item_amount), 2),
             )
             if key in seen:
+                # duplicate – likely repeated summary row
                 continue
             seen.add(key)
-            new_items.append(it)
+            new_items.append(item)
+
         p.bill_items = new_items
-        out.append(p)
-    return out
+        deduped_pages.append(p)
+
+    return deduped_pages
 
 
-# ============================================================
-#  GET Health
-# ============================================================
-
-@app.get("/extract-bill-data")
-def health():
-    return {
-        "status": "OK",
-        "message": "Use POST /extract-bill-data with JSON body "
-                   '{"document": "<public image/PDF URL>"}',
-    }
-
-
-# ============================================================
-#  POST Endpoint
-# ============================================================
-
-@app.post("/extract-bill-data", response_model=ExtractBillDataResponse)
-def extract_api(req: ExtractBillDataRequest):
-    t0 = time.time()
-    doc_url = str(req.document)
-
-    # 1) Download
-    content = download_document(doc_url)
-
-    # 2) Convert to images (one per page)
-    images = document_to_images(doc_url, content)
-    num_pages = len(images)
-
-    if num_pages == 0:
-        return ExtractBillDataResponse(
-            is_success=False,
-            message="No pages/images could be extracted from document.",
-        )
-
-    # --------------------------------------------------------
-    # 1) FAST BATCH PASS (Scout) — <= 5 images per call
-    # --------------------------------------------------------
-    batches: List[List[dict]] = []
-    for i in range(0, num_pages, 5):
-        block: List[dict] = [
-            {
-                "type": "input_text",
-                "text": f"Pages {i + 1}-{min(i + 5, num_pages)}:",
-            }
-        ]
-        for j in range(i, min(i + 5, num_pages)):
-            block.append(
-                {
-                    "type": "input_text",
-                    "text": f"PAGE {j + 1}:",
-                }
-            )
-            block.append(
-                {
-                    "type": "input_image",
-                    "image_url": images[j],
-                    "detail": "auto",
-                }
-            )
-        batches.append(block)
-
-    total_usage = TokenUsage(0, 0, 0)
-    pages_dict: Dict[int, Dict[str, Any]] = {
-        i: {"page_no": str(i + 1), "page_type": "Bill Detail", "bill_items": []}
-        for i in range(num_pages)
-    }
-
-    for b in batches:
-        user_blocks = [{"type": "input_text", "text": USER_PROMPT_GLOBAL}] + b
-        parsed, u = groq_call(MODEL_FAST, SYSTEM_PROMPT, user_blocks)
-
-        total_usage.total_tokens += u.total_tokens
-        total_usage.input_tokens += u.input_tokens
-        total_usage.output_tokens += u.output_tokens
-
-        part_pages = normalize_pages_from_fast(parsed, num_pages)
-        # Merge into global dict (later batches can overwrite same pages)
-        for idx, page_dict in part_pages.items():
-            pages_dict[idx] = page_dict
-
-    # --------------------------------------------------------
-    # 2) ACCURACY PASS (Maverick) on Final Bill pages only
-    # --------------------------------------------------------
-    for idx in range(num_pages):
-        p = pages_dict[idx]
-        ptype = str(p.get("page_type", "")).strip().lower()
-        if ptype == "final bill":
-            # Re-run just this page with Maverick, more accurate read
-            parsed, u = groq_call(
-                MODEL_ACCURATE,
-                SYSTEM_PROMPT,
-                [
-                    {"type": "input_text", "text": USER_PROMPT_SINGLE},
-                    {
-                        "type": "input_image",
-                        "image_url": images[idx],
-                        "detail": "high",
-                    },
-                ],
-            )
-            total_usage.total_tokens += u.total_tokens
-            total_usage.input_tokens += u.input_tokens
-            total_usage.output_tokens += u.output_tokens
-
-            page_norm = normalize_single_page_output(parsed, idx)
-            pages_dict[idx] = page_norm
-
-    # --------------------------------------------------------
-    # 3) CLEANING + VALIDATION
-    # --------------------------------------------------------
-    pages: List[PageItems] = []
-    for idx in range(num_pages):
-        raw_page = pages_dict[idx]
-        # ensure correct page_no
-        raw_page["page_no"] = str(idx + 1)
-        cleaned_dict = clean_page_dict(raw_page)
-        try:
-            page = PageItems(**cleaned_dict)
-        except Exception as e:
-            raise HTTPException(500, f"Model JSON does not match schema: {e}")
-        page = fix_math(page)
-        pages.append(page)
-
-    # 4) De-duplicate across pages
-    pages = dedupe_across_pages(pages)
-
-    # 5) Aggregate
+def aggregate_all_pages(pages: List[PageItems]) -> ExtractBillDataResponseData:
+    """
+    Compute total_item_count. Grand total is intentionally NOT included in
+    the schema (organizers will compute it from bill_items).
+    """
     total_items = sum(len(p.bill_items) for p in pages)
-    data = ExtractBillDataResponseData(
+    return ExtractBillDataResponseData(
         pagewise_line_items=pages,
         total_item_count=total_items,
     )
 
-    elapsed = time.time() - t0
+
+def compute_grand_total_amount(pages: List[PageItems]) -> float:
+    """
+    Utility: sum of all item_amounts – for logging only.
+    """
+    total = 0.0
+    for p in pages:
+        for item in p.bill_items:
+            total += float(item.item_amount)
+    return round(total, 2)
+
+
+# ============================================================
+#  Health Check (GET) – handles evaluator GET pings
+# ============================================================
+
+@app.get("/extract-bill-data")
+def health_check():
+    """
+    Simple GET endpoint so health checks don't see 405.
+    The evaluators will use POST for actual scoring.
+    """
+    return {
+        "message": "Health OK. Use POST /extract-bill-data with JSON body "
+                   '{"document": "<public image/PDF URL>"} to extract bill data.'
+    }
+
+
+# ============================================================
+#  Main Datathon Endpoint (POST)
+# ============================================================
+
+@app.post("/extract-bill-data", response_model=ExtractBillDataResponse)
+def extract_bill_data(req: ExtractBillDataRequest):
+    """
+    Main Datathon endpoint.
+
+    Request:
+        {
+          "document": "<public URL to image or PDF>"
+        }
+
+    Response (SUCCESS, 200):
+        {
+          "is_success": true,
+          "token_usage": {
+            "total_tokens": int,
+            "input_tokens": int,
+            "output_tokens": int
+          },
+          "data": {
+            "pagewise_line_items": [...],
+            "total_item_count": int
+          }
+        }
+    """
+    start_time = time.time()
+    url_str = str(req.document)
+
+    # 1. Download document
+    content = download_document(url_str)
+
+    # 2. Convert to per-page infos (image → data_url)
+    page_infos = document_to_page_infos(url_str, content)
+    num_pages = len(page_infos)
+
+    if num_pages == 0:
+        elapsed = time.time() - start_time
+        print(
+            f"[BILL_EXTRACT] pages=0 items=0 total_amount=0.00 tokens=0 "
+            f"time_sec={elapsed:.2f} (no pages)"
+        )
+        return ExtractBillDataResponse(
+            is_success=False,
+            message="No pages/images could be extracted from the document.",
+        )
+
+    # 3. Process pages in batches of <= MAX_IMAGES_PER_REQUEST
+    all_pages: List[PageItems] = []
+    total_tokens = 0
+    input_tokens = 0
+    output_tokens = 0
+
+    for batch_start in range(0, num_pages, MAX_IMAGES_PER_REQUEST):
+        batch_end = min(batch_start + MAX_IMAGES_PER_REQUEST, num_pages)
+        batch_page_infos = page_infos[batch_start:batch_end]
+
+        raw_pages_batch, usage_batch = call_groq_for_batch(batch_page_infos)
+
+        total_tokens += usage_batch.total_tokens
+        input_tokens += usage_batch.input_tokens
+        output_tokens += usage_batch.output_tokens
+
+        # Map batch-local page_no → global page_no
+        for i, page_dict in enumerate(raw_pages_batch):
+            global_page_no = batch_start + i + 1  # 1-based for entire document
+            page_dict["page_no"] = str(global_page_no)
+            page_items = reconcile_page_items(page_dict)
+            all_pages.append(page_items)
+
+    if not all_pages:
+        elapsed = time.time() - start_time
+        print(
+            f"[BILL_EXTRACT] pages={num_pages} items=0 total_amount=0.00 "
+            f"tokens={total_tokens} time_sec={elapsed:.2f} (no items)"
+        )
+        return ExtractBillDataResponse(
+            is_success=False,
+            token_usage=TokenUsage(
+                total_tokens=total_tokens,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+            ),
+            message="Model did not return any page items.",
+        )
+
+    # 4. De-duplicate obviously repeated items across pages
+    all_pages = dedupe_all_pages(all_pages)
+
+    # 5. Aggregate
+    data = aggregate_all_pages(all_pages)
+
+    token_usage = TokenUsage(
+        total_tokens=total_tokens,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+    )
+
+    # 6. Compute a simple "grand total amount" for logging
+    grand_total = compute_grand_total_amount(all_pages)
+    elapsed = time.time() - start_time
+
+    # Railway log line – helps you debug performance & quality
     print(
-        f"[BILL] pages={num_pages} items={total_items} "
-        f"tokens={total_usage.total_tokens} time={elapsed:.2f}s"
+        f"[BILL_EXTRACT] pages={num_pages} "
+        f"items={data.total_item_count} "
+        f"total_amount={grand_total:.2f} "
+        f"tokens={token_usage.total_tokens} "
+        f"time_sec={elapsed:.2f}"
     )
 
     return ExtractBillDataResponse(
         is_success=True,
-        token_usage=total_usage,
+        token_usage=token_usage,
         data=data,
     )
