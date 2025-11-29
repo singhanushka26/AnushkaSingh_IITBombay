@@ -13,7 +13,7 @@ import requests
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, HttpUrl
 from pdf2image import convert_from_bytes
-from PIL import Image, ImageEnhance
+from PIL import Image
 from openai import OpenAI
 
 # ============================================================
@@ -25,16 +25,17 @@ client = OpenAI(
     base_url="https://api.groq.com/openai/v1",
 )
 
-# Accuracy mode: Maverick by default (can override via env)
+# Balanced mode: fast + good accuracy
 GROQ_VISION_MODEL_ID = os.environ.get(
     "GROQ_VISION_MODEL_ID",
-    "meta-llama/llama-4-maverick-17b-128e-instruct",
+    "meta-llama/llama-4-scout-17b-16e-instruct",
 )
 
-# Groq Vision limit: MAX 5 images per request – we use 1/page for accuracy
-MAX_IMAGES_PER_REQUEST = 1
+# Groq Vision limit: MAX 5 images per request
+MAX_IMAGES_PER_REQUEST = 5
 
-# Parallel batches for speed (safe for Hobby tier)
+# How many Groq batches to run in parallel
+# 2–3 is usually safe; 3 uses more bandwidth but is faster.
 MAX_PARALLEL_BATCHES = 3
 
 
@@ -83,12 +84,13 @@ class ExtractBillDataResponse(BaseModel):
 
 app = FastAPI(
     title="Bajaj Datathon Bill Extraction API",
-    version="7.0.0",
+    version="6.0.0",
     description=(
-        "Extracts line items from multi-page hospital bills using "
-        "Groq LLaMA 4 Maverick Vision with high-accuracy settings. "
-        "One page per request for best extraction, with parallel batches "
-        "for speed. Implements the HackRx Datathon schema."
+        "Extracts line items from multi-page bill/invoice documents using "
+        "Groq vision models with batched + parallel processing "
+        "(max 5 images per request, multi-batch concurrency). "
+        "Implements the exact HackRx Datathon schema and is tuned for "
+        "high accuracy while staying under time limits on large PDFs."
     ),
 )
 
@@ -126,10 +128,10 @@ def guess_mime_type(url: str, content: bytes) -> str:
     return "application/octet-stream"
 
 
-def _resize_for_vision(img: Image.Image, max_dim: int = 1600) -> Image.Image:
+def _resize_for_vision(img: Image.Image, max_dim: int = 900) -> Image.Image:
     """
     Downscale to reduce tokens & latency while keeping table details readable.
-    Accuracy mode: slightly larger images (max_dim=1600).
+    Slightly smaller than before for faster model calls.
     """
     w, h = img.size
     scale = max(w, h) / float(max_dim)
@@ -140,34 +142,21 @@ def _resize_for_vision(img: Image.Image, max_dim: int = 1600) -> Image.Image:
     return img.resize((new_w, new_h), Image.LANCZOS)
 
 
-def _enhance_for_vision(img: Image.Image) -> Image.Image:
-    """
-    Enhance contrast & sharpness so thin table lines and small fonts
-    are easier for the vision model to read.
-    """
-    img = ImageEnhance.Contrast(img).enhance(1.6)
-    img = ImageEnhance.Sharpness(img).enhance(1.3)
-    return img
-
-
-def image_to_data_url(img: Image.Image, quality: int = 90) -> str:
+def image_to_data_url(img: Image.Image, quality: int = 50) -> str:
     """
     Convert a PIL Image into a base64 JPEG data URL.
 
-    Accuracy mode:
-    - Resize to max_dim=1600
-    - JPEG quality ~90 (sharp text)
+    - Resize to max_dim=900
+    - JPEG quality ~50 (enough for text to be readable for the model)
     - Ensure < 4 MB per image as per Groq base64 limits.
     """
-    img = _resize_for_vision(img, max_dim=1600)
-    img = _enhance_for_vision(img)
+    img = _resize_for_vision(img, max_dim=900)
 
     buf = io.BytesIO()
     img.save(buf, format="JPEG", quality=quality, optimize=True)
     b = buf.getvalue()
 
-    # If still too big, gradually reduce quality
-    while len(b) > 4 * 1024 * 1024 and quality > 50:
+    while len(b) > 4 * 1024 * 1024 and quality > 30:
         quality -= 5
         buf = io.BytesIO()
         img.save(buf, format="JPEG", quality=quality, optimize=True)
@@ -189,8 +178,8 @@ def document_to_page_infos(url: str, content: bytes) -> List[Dict[str, Any]]:
     - If image: one page.
     - If PDF: one image per page.
 
-    Accuracy mode:
-    - PDF rendered at higher DPI (220) directly to JPEG.
+    OPTIMIZED:
+    - PDF rendered at lower DPI (150) directly to JPEG.
     - Multi-threaded conversion (thread_count=4) to use multiple vCPUs.
     """
     mime = guess_mime_type(url, content)
@@ -217,10 +206,10 @@ def document_to_page_infos(url: str, content: bytes) -> List[Dict[str, Any]]:
     # PDFs
     if mime == "application/pdf":
         try:
-            # Higher dpi + enhancement for thin fonts
+            # Lower dpi + jpeg + multi-threaded = MUCH faster than defaults
             pages = convert_from_bytes(
                 content,
-                dpi=220,
+                dpi=150,
                 fmt="jpeg",
                 thread_count=4,
             )
@@ -271,8 +260,8 @@ You are an expert medical BILL ITEM extraction engine for hospital bills.
 
 Your goals:
 
-1) Capture EVERY genuine line item from the tables (very high recall).
-2) Do NOT double-count or duplicate the same VISUAL table row (no over-count).
+1) Capture EVERY genuine line item from the tables (high recall).
+2) Do NOT double-count or duplicate the same line item (no over-count).
 3) Make the sum of all `item_amount` values across all pages as close as possible
    to the FINAL TOTAL printed in the bill.
 4) Respect the exact JSON structure required by the HackRx Datathon.
@@ -324,10 +313,7 @@ You MUST NOT output these rows as bill_items.
 
 2. DO NOT MISS ITEMS
    - For every visible row with description + amount in a table, output one bill_items entry.
-   - SCAN EVERY ROW in every table on each page.
-   - EVEN IF multiple rows have IDENTICAL text and identical numbers
-     (e.g. many rows of "IP CONSULTATION CHARGES" with the same rate/qty/amount),
-     you MUST output EACH VISUAL ROW as a separate bill_items entry.
+   - Skip pure headers/titles and pure total/summary rows.
 
 3. DO NOT DOUBLE-COUNT
    - If an item is shown as a detailed line item and then repeated as a section total
@@ -419,13 +405,13 @@ You are given a BATCH of {num_batch_pages} page image(s) from a hospital bill.
 The images will be provided in order for this batch:
     first image is batch page 1, second is batch page 2, ..., up to batch page {num_batch_pages}.
 
-For EACH batch page i (1-based), you MUST:
-- Set page_no = "<i>" (as a string).
-- Choose page_type from: "Bill Detail", "Final Bill", "Pharmacy".
-- SCAN EVERY TABLE ROW on that page. For each row that contains a
-  description + amount, you MUST create one bill_items entry.
-- Do this even if rows look similar or identical across the page.
-- Extract bill_items ONLY for that specific page.
+For EACH batch page i (1-based), you must:
+- Set page_no = "<i>" (as a string)
+- Choose page_type from: "Bill Detail", "Final Bill", "Pharmacy"
+- Extract bill_items ONLY for that page.
+
+Then return ONE combined JSON object for this batch, matching exactly the
+structure described in the system instructions.
 """
 
     user_content: List[Dict[str, Any]] = [
@@ -563,12 +549,12 @@ def clean_page_dict(page_dict: Dict[str, Any]) -> Dict[str, Any]:
     """
     Pre-clean the raw JSON dict from the model so that Pydantic parsing will not
     fail when numeric fields are null/empty/etc.
-
-    Accuracy mode: we DO NOT de-duplicate items here – repeated identical rows
-    (e.g. many 'IP CONSULTATION CHARGES' lines) are kept as-is.
+    Also performs within-page exact duplicate removal (same name + numbers).
     """
     bill_items = page_dict.get("bill_items", []) or []
     cleaned_items: List[Dict[str, Any]] = []
+
+    seen_keys: Set[Tuple[str, float, float, float]] = set()
 
     for item in bill_items:
         if not isinstance(item, dict):
@@ -578,6 +564,16 @@ def clean_page_dict(page_dict: Dict[str, Any]) -> Dict[str, Any]:
         amount = _coerce_number(item.get("item_amount"))
         rate = _coerce_number(item.get("item_rate"))
         qty = _coerce_number(item.get("item_quantity"))
+
+        key = (
+            name.lower(),
+            round(amount, 2),
+            round(rate, 4),
+            round(qty, 4),
+        )
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
 
         cleaned_items.append(
             {
@@ -632,10 +628,30 @@ def reconcile_page_items(page_dict: Dict[str, Any]) -> PageItems:
 
 def dedupe_all_pages(pages: List[PageItems]) -> List[PageItems]:
     """
-    Accuracy mode: no cross-page de-duplication.
-    We return pages unchanged so repeated identical lines are preserved.
+    De-duplicate clearly repeated items across pages.
     """
-    return pages
+    seen: Set[Tuple[str, str, float, float, float]] = set()
+    deduped_pages: List[PageItems] = []
+
+    for p in pages:
+        new_items: List[BillItem] = []
+        for item in p.bill_items:
+            key = (
+                p.page_type.strip().lower(),
+                item.item_name.strip().lower(),
+                round(float(item.item_rate), 4),
+                round(float(item.item_quantity), 4),
+                round(float(item.item_amount), 2),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            new_items.append(item)
+
+        p.bill_items = new_items
+        deduped_pages.append(p)
+
+    return deduped_pages
 
 
 def aggregate_all_pages(pages: List[PageItems]) -> ExtractBillDataResponseData:
@@ -661,10 +677,8 @@ def compute_grand_total_amount(pages: List[PageItems]) -> float:
 @app.get("/extract-bill-data")
 def health_check():
     return {
-        "message": (
-            "Health OK. Use POST /extract-bill-data with JSON body "
-            '{"document": "<public image/PDF URL>"} to extract bill data.'
-        )
+        "message": "Health OK. Use POST /extract-bill-data with JSON body "
+                   '{"document": "<public image/PDF URL>"} to extract bill data.'
     }
 
 
@@ -695,7 +709,7 @@ def extract_bill_data(req: ExtractBillDataRequest):
             message="No pages/images could be extracted from the document.",
         )
 
-    # 3. Build batches of ≤ MAX_IMAGES_PER_REQUEST (here: 1/page)
+    # 3. Build batches of ≤ MAX_IMAGES_PER_REQUEST
     batches: List[Tuple[int, List[Dict[str, Any]]]] = []
     for batch_start in range(0, num_pages, MAX_IMAGES_PER_REQUEST):
         batch_end = min(batch_start + MAX_IMAGES_PER_REQUEST, num_pages)
@@ -767,7 +781,7 @@ def extract_bill_data(req: ExtractBillDataRequest):
                 )
             )
 
-    # 5. (Accuracy mode) No cross-page de-duplication
+    # 5. De-duplicate obviously repeated items across pages
     all_pages = dedupe_all_pages(all_pages)
 
     # 6. Aggregate
