@@ -121,7 +121,47 @@ The entire pipeline is optimized to deliver high accuracy while remaining robust
 
 ---
 
-##   **4. Pipeline Logic**
+## **4. Running Locally**
+### **Install Dependencies**
+```
+pip install -r requirements.txt
+```
+
+### **Environment Variable**
+```
+export GROQ_API_KEY="your-key"
+```
+
+### **Run the Server**
+```
+uvicorn main:app --host 0.0.0.0 --port 8000
+```
+
+### **Test**
+```
+curl -X POST http://localhost:8000/extract-bill-data \
+  -H "Content-Type: application/json" \
+  -d '{"document": "https://example.com/bill.pdf"}'
+```
+
+---
+
+## **5. Deployment**
+Works on:
+- Railway
+- Render
+- AWS EC2
+- Docker
+
+Your repo already contains:
+- `Dockerfile`
+- `Procfile`
+- `requirements.txt`
+- `main.py`
+
+---
+
+##   **6. Pipeline Logic**
 
 ### **1. Bulk Extraction (Scout)**
 
@@ -173,7 +213,7 @@ Produces:
 
 ---
 
-## **5. API Routes**
+## **7. API Routes**
 
 ### **GET /extract-bill-data**
 
@@ -221,7 +261,7 @@ Response:
 
 ---
 
-## **6. Project Structure**
+## **8. Project Structure**
 
 ```
 .
@@ -235,7 +275,7 @@ Response:
 
 ---
 
-## **7. Why This Pipeline Works Well**
+## **9. Why This Pipeline Works Well**
 
 * Dual-stage extraction: fast + accurate
 * OCR used only for structural cues (fast, not heavy OCR)
@@ -246,7 +286,7 @@ Response:
 
 ---
 
-## **8. Future Enhancements**
+## **10. Future Enhancements**
 
 * Bounding-box extraction
 * Table segmentation model
@@ -257,7 +297,7 @@ Response:
 
 ---
 
-## **9. Contact**
+## **11. Contact**
 * Name:     Anushka
 * Email:    22b0714@iitb.ac.in
 * College:  IIT Bombay
