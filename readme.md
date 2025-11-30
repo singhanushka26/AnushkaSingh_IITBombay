@@ -144,24 +144,10 @@ curl -X POST http://localhost:8000/extract-bill-data \
   -d '{"document": "https://example.com/bill.pdf"}'
 ```
 
----
-
-## **5. Deployment**
-Works on:
-- Railway
-- Render
-- AWS EC2
-- Docker
-
-Your repo already contains:
-- `Dockerfile`
-- `Procfile`
-- `requirements.txt`
-- `main.py`
 
 ---
 
-##   **6. Pipeline Logic**
+## **5. Pipeline Logic**
 
 ### **1. Bulk Extraction (Scout)**
 
@@ -213,7 +199,7 @@ Produces:
 
 ---
 
-## **7. API Routes**
+## **6. API Routes**
 
 ### **GET /extract-bill-data**
 
@@ -261,7 +247,7 @@ Response:
 
 ---
 
-## **8. Project Structure**
+## **7. Project Structure**
 
 ```
 .
@@ -275,7 +261,7 @@ Response:
 
 ---
 
-## **9. Why This Pipeline Works Well**
+## **8. Why This Pipeline Works Well**
 
 * Dual-stage extraction: fast + accurate
 * OCR used only for structural cues (fast, not heavy OCR)
@@ -286,7 +272,7 @@ Response:
 
 ---
 
-## **10. Future Enhancements**
+## **9. Future Enhancements**
 
 * Bounding-box extraction
 * Table segmentation model
@@ -297,7 +283,7 @@ Response:
 
 ---
 
-## **11. Contact**
+## **10. Contact**
 * Name:     Anushka
 * Email:    22b0714@iitb.ac.in
 * College:  IIT Bombay
