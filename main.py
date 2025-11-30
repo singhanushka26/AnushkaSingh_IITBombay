@@ -16,14 +16,6 @@ from pdf2image import convert_from_bytes
 from PIL import Image, ImageEnhance
 from openai import OpenAI
 
-# Optional OCR (pytesseract)
-try:
-    import pytesseract
-    HAS_PYTESSERACT = True
-except ImportError:
-    pytesseract = None
-    HAS_PYTESSERACT = False
-
 # ============================================================
 #  Groq Client (OpenAI-compatible)
 # ============================================================
@@ -47,9 +39,6 @@ GROQ_VISION_MODEL_MAVERICK = os.environ.get(
 
 # Groq Vision limit: MAX 5 images per request
 MAX_IMAGES_PER_REQUEST = 5
-
-# Hard time budget (seconds) – we try to stay roughly under this
-GLOBAL_TIME_BUDGET_SEC = 120.0
 
 
 # ============================================================
@@ -96,14 +85,13 @@ class ExtractBillDataResponse(BaseModel):
 # ============================================================
 
 app = FastAPI(
-    title="Bajaj Datathon Bill Extraction API",
+    title="Bajaj Datathon Bill Extraction API (Balanced Mode)",
     version="8.0.0",
     description=(
-        "Extracts line items from multi-page bill/invoice documents using "
-        "Groq vision models with batching (max 5 images per request). "
-        "Scout does bulk extraction; Maverick refines suspicious pages with OCR hints. "
-        "Implements the exact HackRx Datathon schema and is tuned for "
-        "high accuracy while staying under time limits on large PDFs."
+        "Balanced speed/accuracy bill extraction pipeline using Groq LLaMA-4 "
+        "Scout (batch) and Maverick (refinement). Dynamic time budget per "
+        "document so small PDFs get more refinement while large PDFs stay "
+        "under ~120 seconds total."
     ),
 )
 
@@ -138,7 +126,6 @@ def guess_mime_type(url: str, content: bytes) -> str:
 def _resize_for_vision(img: Image.Image, max_dim: int = 950) -> Image.Image:
     """
     Downscale to reduce tokens & latency while keeping table details readable.
-    Slightly smaller than before for better speed on 20–30 pages.
     """
     w, h = img.size
     scale = max(w, h) / float(max_dim)
@@ -158,48 +145,30 @@ def _enhance_for_vision(img: Image.Image) -> Image.Image:
     return img
 
 
-def pil_to_data_url(img: Image.Image, quality: int = 60) -> str:
+def image_to_data_url(img: Image.Image, quality: int = 70) -> str:
     """
     Convert a PIL Image into a base64 JPEG data URL.
-    Assumes img is already reasonably sized.
+
+    - Resize to max_dim=950
+    - Slight enhancement
+    - JPEG quality ~70
+    - Ensure < 4 MB per image
     """
+    img = _resize_for_vision(img, max_dim=950)
+    img = _enhance_for_vision(img)
+
     buf = io.BytesIO()
     img.save(buf, format="JPEG", quality=quality)
     b = buf.getvalue()
 
-    # Ensure < 4 MB per image
-    q = quality
-    while len(b) > 4 * 1024 * 1024 and q > 30:
-        q -= 10
+    while len(b) > 4 * 1024 * 1024 and quality > 40:
+        quality -= 10
         buf = io.BytesIO()
-        img.save(buf, format="JPEG", quality=q)
+        img.save(buf, format="JPEG", quality=quality)
         b = buf.getvalue()
 
     b64 = base64.b64encode(b).decode("utf-8")
     return f"data:image/jpeg;base64,{b64}"
-
-
-def image_to_data_url(img: Image.Image, quality: int = 60) -> str:
-    """
-    Convert a PIL Image into a base64 JPEG data URL, with resize + enhance.
-    """
-    img = _resize_for_vision(img, max_dim=950)
-    img = _enhance_for_vision(img)
-    return pil_to_data_url(img, quality=quality)
-
-
-def data_url_to_pil(data_url: str) -> Image.Image:
-    """
-    Decode a data URL back into a PIL Image.
-    Used for cropping + OCR in refinement.
-    """
-    try:
-        header, b64data = data_url.split(",", 1)
-    except ValueError:
-        b64data = data_url
-    img_bytes = base64.b64decode(b64data)
-    img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-    return img
 
 
 def document_to_page_infos(url: str, content: bytes) -> List[Dict[str, Any]]:
@@ -272,6 +241,45 @@ def document_to_page_infos(url: str, content: bytes) -> List[Dict[str, Any]]:
         }
     )
     return page_infos
+
+
+# ============================================================
+#  Shared JSON Parsing Helper
+# ============================================================
+
+def _parse_model_json(raw_text: str, context: str) -> Any:
+    """
+    Robustly parse model output as JSON:
+    - Strip ``` fences if present
+    - Take substring from first '{' to last '}'
+    - Raise a clean HTTPException if parsing fails
+    """
+    s = raw_text.strip()
+
+    # Remove markdown fences if present
+    if s.startswith("```"):
+        lines = s.splitlines()
+        # drop first line (``` or ```json)
+        lines = lines[1:]
+        # drop last line if it's ```
+        if lines and lines[-1].strip().startswith("```"):
+            lines = lines[:-1]
+        s = "\n".join(lines).strip()
+
+    # Now crop from first '{' to last '}'
+    first = s.find("{")
+    last = s.rfind("}")
+    if first != -1 and last != -1 and last > first:
+        s = s[first:last + 1]
+
+    try:
+        return json.loads(s)
+    except Exception:
+        snippet = s[:200].replace("\n", " ")
+        raise HTTPException(
+            status_code=500,
+            detail=f"{context} response is not valid JSON: {snippet}",
+        )
 
 
 # ============================================================
@@ -359,16 +367,15 @@ STRICT REQUIREMENTS:
 SYSTEM_PROMPT_MAVERICK = """
 You are a precise hospital BILL ITEM extraction engine.
 
-You will see ONE hospital bill page (with an optional zoomed crop).
-You may also see OCR text for that page.
+You will see ONLY ONE page image of a hospital bill.
 
 Your task:
 
 - Read all charge tables on this page.
 - For EVERY visible row that represents a real charge (with description + amount),
   output ONE bill_items entry.
-- DO NOT output totals, sub-totals, purely summary/tax rows, or grand totals.
-- JSON ONLY – no markdown, no comments.
+- DO NOT output totals, sub-totals, or purely summary/tax rows.
+- Do NOT add any commentary. Return JSON ONLY.
 
 Output format for this SINGLE PAGE:
 
@@ -391,44 +398,17 @@ Output format for this SINGLE PAGE:
 }
 
 Rules:
+- JSON only (no markdown, no comments).
 - Numeric fields must be numbers, not strings.
-- If quantity is missing but amount is visible: quantity = 1.0, rate = amount.
-- If rate is missing but quantity & amount are visible: rate = amount / quantity.
-- If a numeric field is unreadable: set it to 0.0.
+- If quantity is missing but amount is visible: quantity=1.0, rate=amount.
+- If rate is missing but quantity & amount are visible: rate=amount/quantity.
+- If a numeric field is unreadable: set 0.0.
 """
 
 
 # ============================================================
-#  Groq Calls – Scout batch + Maverick single-page
+#  Groq Calls
 # ============================================================
-
-def _safe_json_loads(raw_text: str, context: str) -> Any:
-    """
-    Robust JSON parsing:
-    - First try json.loads directly
-    - If that fails, strip everything before first '{' and after last '}'
-    """
-    raw_text = raw_text.strip()
-
-    try:
-        return json.loads(raw_text)
-    except json.JSONDecodeError:
-        first = raw_text.find("{")
-        last = raw_text.rfind("}")
-        if first != -1 and last != -1 and last > first:
-            json_str = raw_text[first:last + 1]
-            try:
-                return json.loads(json_str)
-            except Exception:
-                raise HTTPException(
-                    status_code=500,
-                    detail=f"{context} response is not valid JSON (inner slice): {raw_text[:200]}",
-                )
-        raise HTTPException(
-            status_code=500,
-            detail=f"{context} response is not valid JSON (no braces): {raw_text[:200]}",
-        )
-
 
 def call_groq_for_batch(
     batch_page_infos: List[Dict[str, Any]],
@@ -479,7 +459,9 @@ For EACH batch page i (1-based), you must:
             input=[
                 {
                     "role": "system",
-                    "content": [{"type": "input_text", "text": SYSTEM_PROMPT_SCOUT.strip()}],
+                    "content": [
+                        {"type": "input_text", "text": SYSTEM_PROMPT_SCOUT.strip()}
+                    ],
                 },
                 {
                     "role": "user",
@@ -508,7 +490,7 @@ For EACH batch page i (1-based), you must:
     )
 
     raw_text = response.output_text.strip()
-    parsed = _safe_json_loads(raw_text, context="Scout")
+    parsed = _parse_model_json(raw_text, context="Scout")
 
     if isinstance(parsed, dict) and "pagewise_line_items" in parsed:
         raw_pages = parsed.get("pagewise_line_items", []) or []
@@ -517,7 +499,7 @@ For EACH batch page i (1-based), you must:
     else:
         raise HTTPException(
             status_code=500,
-            detail="Scout JSON for batch does not contain 'pagewise_line_items' list.",
+            detail="Scout JSON does not contain 'pagewise_line_items' list.",
         )
 
     # Guarantee one page object per input page in this batch
@@ -535,120 +517,26 @@ For EACH batch page i (1-based), you must:
     return raw_pages, token_usage
 
 
-def get_ocr_hint_for_page(page_info: Dict[str, Any]) -> str:
-    """
-    Use pytesseract to get a short OCR hint string for this page.
-    If pytesseract is not available, returns empty string.
-    """
-    if not HAS_PYTESSERACT:
-        return ""
-
-    try:
-        img = data_url_to_pil(page_info["data_url"])
-    except Exception:
-        return ""
-
-    try:
-        text = pytesseract.image_to_string(img, config="--psm 6")
-    except Exception:
-        return ""
-
-    # Keep only first ~800 chars to control token usage
-    text = text.strip().replace("\n\n", "\n")
-    if len(text) > 800:
-        text = text[:800]
-
-    return text
-
-
-def get_zoom_crop_data_url(page_info: Dict[str, Any]) -> Optional[str]:
-    """
-    Create a zoomed crop of the central band of the page where tables usually are.
-    Returns a data_url for the crop, or None on failure.
-    """
-    try:
-        img = data_url_to_pil(page_info["data_url"])
-    except Exception:
-        return None
-
-    w, h = img.size
-    # Central vertical band: from 18% to 88% height, with small horizontal margins
-    left = int(0.05 * w)
-    right = int(0.95 * w)
-    top = int(0.18 * h)
-    bottom = int(0.88 * h)
-
-    if right <= left or bottom <= top:
-        return None
-
-    crop = img.crop((left, top, right, bottom))
-    crop = _resize_for_vision(crop, max_dim=900)
-    crop = _enhance_for_vision(crop)
-    return pil_to_data_url(crop, quality=65)
-
-
 def call_groq_for_single_page_maverick(
-    page_info: Dict[str, Any],
-    use_ocr: bool = True,
-    use_crop: bool = True,
+    page_info: Dict[str, Any]
 ) -> Tuple[Dict[str, Any], TokenUsage]:
     """
-    Single-page refinement using Maverick with optional crop + OCR.
+    Single-page refinement using Maverick.
     Returns:
         - raw_page: one dict with page_no="1", page_type, bill_items
         - token_usage: TokenUsage for this Maverick call
-
-    Any JSON/LLM error is raised and handled by caller (fallback to Scout).
     """
-    user_content: List[Dict[str, Any]] = []
-
-    # Optional OCR hint
-    if use_ocr:
-        ocr_hint = get_ocr_hint_for_page(page_info)
-        if ocr_hint:
-            user_content.append(
-                {
-                    "type": "input_text",
-                    "text": (
-                        "OCR text from this page (may contain noise, use it only to "
-                        "understand column names and dates):\n" + ocr_hint
-                    ),
-                }
-            )
-
-    # Explain image ordering
-    if use_crop:
-        user_content.append(
-            {
-                "type": "input_text",
-                "text": "First image is a zoomed crop of the main charge tables; second is the full page.",
-            }
-        )
-        crop_url = get_zoom_crop_data_url(page_info)
-        if crop_url:
-            user_content.append(
-                {
-                    "type": "input_image",
-                    "image_url": crop_url,
-                    "detail": "high",
-                }
-            )
-        # Full page
-        user_content.append(
-            {
-                "type": "input_image",
-                "image_url": page_info["data_url"],
-                "detail": "high",
-            }
-        )
-    else:
-        user_content.append(
-            {
-                "type": "input_image",
-                "image_url": page_info["data_url"],
-                "detail": "high",
-            }
-        )
+    user_content: List[Dict[str, Any]] = [
+        {
+            "type": "input_text",
+            "text": "This is a single hospital bill page. Extract all charge line items only.",
+        },
+        {
+            "type": "input_image",
+            "image_url": page_info["data_url"],
+            "detail": "high",
+        },
+    ]
 
     try:
         response = client.responses.create(
@@ -656,7 +544,9 @@ def call_groq_for_single_page_maverick(
             input=[
                 {
                     "role": "system",
-                    "content": [{"type": "input_text", "text": SYSTEM_PROMPT_MAVERICK.strip()}],
+                    "content": [
+                        {"type": "input_text", "text": SYSTEM_PROMPT_MAVERICK.strip()}
+                    ],
                 },
                 {
                     "role": "user",
@@ -685,7 +575,7 @@ def call_groq_for_single_page_maverick(
     )
 
     raw_text = response.output_text.strip()
-    parsed = _safe_json_loads(raw_text, context="Maverick")
+    parsed = _parse_model_json(raw_text, context="Maverick")
 
     if isinstance(parsed, dict) and "pagewise_line_items" in parsed:
         raw_pages = parsed.get("pagewise_line_items", []) or []
@@ -703,6 +593,7 @@ def call_groq_for_single_page_maverick(
             detail="Maverick JSON returned empty pagewise_line_items.",
         )
 
+    # Use first page only (this call is strictly single-page)
     raw_page = raw_pages[0]
     return raw_page, token_usage
 
@@ -735,7 +626,7 @@ def clean_page_dict(page_dict: Dict[str, Any]) -> Dict[str, Any]:
     fail when numeric fields are null/empty/etc.
 
     IMPORTANT: We DO NOT dedupe within a page here – multiple identical rows
-    (e.g. many IP CONSULTATION CHARGES) must be preserved as separate items.
+    must be preserved as separate items.
     """
     bill_items = page_dict.get("bill_items", []) or []
     cleaned_items: List[Dict[str, Any]] = []
@@ -822,8 +713,12 @@ def enrich_from_patterns(pages: List[PageItems]) -> List[PageItems]:
                 rates[name_key].append(amt / qty)
                 qtys[name_key].append(qty)
 
-    default_rate = {k: (sum(v) / len(v)) for k, v in rates.items() if v}
-    default_qty = {k: (sum(v) / len(v)) for k, v in qtys.items() if v}
+    default_rate = {
+        k: (sum(v) / len(v)) for k, v in rates.items() if v
+    }
+    default_qty = {
+        k: (sum(v) / len(v)) for k, v in qtys.items() if v
+    }
 
     for p in pages:
         for it in p.bill_items:
@@ -868,22 +763,77 @@ def compute_grand_total_amount(pages: List[PageItems]) -> float:
     return round(total, 2)
 
 
-def compute_maverick_budget(num_pages: int) -> int:
+# ============================================================
+#  Dynamic Time Budget + Page Selection for Maverick
+# ============================================================
+
+def compute_time_budget_seconds(num_pages: int) -> float:
     """
-    Dynamic budget: fewer pages → more Maverick refinement.
-    This is a heuristic to stay under ~120s total time.
+    Balanced-high mode:
+    - Small docs: spend more time (higher accuracy).
+    - Large docs: still stay under ~120 seconds total.
     """
     if num_pages <= 5:
-        return min(num_pages, 5)      # Almost all pages
-    if num_pages <= 10:
-        return min(num_pages, 7)
-    if num_pages <= 15:
-        return min(num_pages, 6)
-    if num_pages <= 20:
-        return min(num_pages, 5)
-    if num_pages <= 25:
-        return min(num_pages, 4)
-    return min(num_pages, 3)          # Very large docs, small refinement
+        return 45.0
+    elif num_pages <= 10:
+        return 65.0
+    elif num_pages <= 15:
+        return 80.0
+    elif num_pages <= 20:
+        return 95.0
+    elif num_pages <= 25:
+        return 105.0
+    else:
+        return 115.0  # keep some safety margin under 120s
+
+
+def select_pages_for_maverick(pages: List[PageItems]) -> List[int]:
+    """
+    Rank pages by importance/suspicion for Maverick refinement.
+
+    Heuristics:
+    - Final Bill pages highest priority.
+    - Bill Detail pages next.
+    - Pharmacy lower but still considered.
+    - Pages with very few items are suspicious (likely missing items).
+    """
+    scores: List[Tuple[int, float]] = []
+
+    for idx, p in enumerate(pages):
+        pt = p.page_type.strip().lower()
+        n_items = len(p.bill_items)
+
+        score = 0.0
+        if pt == "final bill":
+            score += 1000.0
+        elif pt == "bill detail":
+            score += 600.0
+        elif pt == "pharmacy":
+            score += 300.0
+
+        # Fewer items → more suspicious → higher score
+        score += max(0.0, 50.0 - min(float(n_items), 50.0))
+
+        scores.append((idx, score))
+
+    scores.sort(key=lambda x: x[1], reverse=True)
+    return [idx for idx, _ in scores]
+
+
+def max_maverick_pages_for_doc(num_pages: int) -> int:
+    """
+    Cap how many pages we refine with Maverick for balanced mode.
+    """
+    if num_pages <= 5:
+        return num_pages  # refine all
+    elif num_pages <= 10:
+        return min(num_pages, 8)
+    elif num_pages <= 15:
+        return min(num_pages, 10)
+    elif num_pages <= 20:
+        return min(num_pages, 10)
+    else:
+        return min(num_pages, 12)
 
 
 # ============================================================
@@ -893,13 +843,15 @@ def compute_maverick_budget(num_pages: int) -> int:
 @app.get("/extract-bill-data")
 def health_check():
     return {
-        "message": "Health OK. Use POST /extract-bill-data with JSON body "
-                   '{"document": "<public image/PDF URL>"} to extract bill data.'
+        "message": (
+            "Health OK. Use POST /extract-bill-data with JSON body "
+            '{"document": "<public image/PDF URL>"} to extract bill data.'
+        )
     }
 
 
 # ============================================================
-#  Main Datathon Endpoint (POST)
+#  Main Datathon Endpoint (POST) – BALANCED MODE
 # ============================================================
 
 @app.post("/extract-bill-data", response_model=ExtractBillDataResponse)
@@ -924,6 +876,9 @@ def extract_bill_data(req: ExtractBillDataRequest):
             is_success=False,
             message="No pages/images could be extracted from the document.",
         )
+
+    # Compute dynamic time budget for this document
+    time_budget = compute_time_budget_seconds(num_pages)
 
     # 3. Scout pass – process pages in batches of <= MAX_IMAGES_PER_REQUEST
     all_pages: List[PageItems] = []
@@ -964,66 +919,50 @@ def extract_bill_data(req: ExtractBillDataRequest):
             message="Model did not return any page items.",
         )
 
-    # 4. Decide Maverick refinement budget dynamically
-    #    We refine "suspicious" pages up to this budget.
-    max_maverick_pages = compute_maverick_budget(num_pages)
+    # 4. Maverick refinement with dynamic time budget
+    elapsed_after_scout = time.time() - start_time
+    remaining_time = time_budget - elapsed_after_scout
 
-    # Rank suspicious pages: few items or "Final Bill" pages first
-    suspicious_indices: List[int] = []
-    for idx, p in enumerate(all_pages):
-        ptype = p.page_type.strip().lower()
-        num_items = len(p.bill_items)
-        score = 0
-        if ptype == "final bill":
-            score += 100
-        if num_items <= 1:
-            score += 50
-        elif num_items <= 3:
-            score += 25
-        if score > 0:
-            suspicious_indices.append((score, idx))
+    if remaining_time > 3.0:
+        # Enough time to try some Maverick refinements
+        candidate_indices = select_pages_for_maverick(all_pages)
+        max_mav_pages = max_maverick_pages_for_doc(num_pages)
 
-    # Sort by suspiciousness descending
-    suspicious_indices.sort(key=lambda x: x[0], reverse=True)
-    selected_indices = [idx for _, idx in suspicious_indices][:max_maverick_pages]
+        refined_count = 0
+        for idx in candidate_indices:
+            if refined_count >= max_mav_pages:
+                break
 
-    # 5. Maverick refinement on selected pages (best-effort, never crashes)
-    for idx in selected_indices:
-        try:
-            raw_page_mav, usage_mav = call_groq_for_single_page_maverick(
-                page_infos[idx],
-                use_ocr=True,
-                use_crop=True,
-            )
-        except HTTPException as e:
-            print(f"[MAVERICK_SKIP] page={idx+1} reason={e.detail}")
-            continue
-        except Exception as e:
-            print(f"[MAVERICK_SKIP] page={idx+1} unexpected_error={e}")
-            continue
+            now = time.time()
+            if now - start_time > time_budget - 3.0:
+                # Keep ~3 seconds buffer and stop refining
+                break
 
-        total_tokens += usage_mav.total_tokens
-        input_tokens += usage_mav.input_tokens
-        output_tokens += usage_mav.output_tokens
+            try:
+                raw_page_mav, usage_mav = call_groq_for_single_page_maverick(
+                    page_infos[idx]
+                )
+            except HTTPException as e:
+                print(f"[MAVERICK_SKIP] page={idx+1} reason={e.detail}")
+                continue
+            except Exception as e:
+                print(f"[MAVERICK_SKIP] page={idx+1} unexpected_error={e}")
+                continue
 
-        # Map Maverick's local page_no ("1") to global page number
-        raw_page_mav["page_no"] = str(idx + 1)
-        refined_page = reconcile_page_items(raw_page_mav)
-        all_pages[idx] = refined_page
+            total_tokens += usage_mav.total_tokens
+            input_tokens += usage_mav.input_tokens
+            output_tokens += usage_mav.output_tokens
 
-        # Optional early stop if we are close to global time budget
-        elapsed_mid = time.time() - start_time
-        if elapsed_mid > GLOBAL_TIME_BUDGET_SEC * 0.9:
-            print(
-                f"[MAVERICK_EARLY_STOP] elapsed={elapsed_mid:.2f}s, "
-                f"stopping further refinement to respect time budget."
-            )
-            break
+            raw_page_mav["page_no"] = str(idx + 1)
+            refined_page = reconcile_page_items(raw_page_mav)
+            all_pages[idx] = refined_page
 
-    # 6. Enrich missing numeric fields using global patterns
+            refined_count += 1
+
+    # 5. Enrich missing numeric fields using global patterns
     all_pages = enrich_from_patterns(all_pages)
 
-    # 7. Aggregate
+    # 6. Aggregate
     data = aggregate_all_pages(all_pages)
 
     token_usage = TokenUsage(
@@ -1032,7 +971,7 @@ def extract_bill_data(req: ExtractBillDataRequest):
         output_tokens=output_tokens,
     )
 
-    # 8. Logging
+    # 7. Logging
     grand_total = compute_grand_total_amount(all_pages)
     elapsed = time.time() - start_time
 
@@ -1041,7 +980,8 @@ def extract_bill_data(req: ExtractBillDataRequest):
         f"items={data.total_item_count} "
         f"total_amount={grand_total:.2f} "
         f"tokens={token_usage.total_tokens} "
-        f"time_sec={elapsed:.2f}"
+        f"time_sec={elapsed:.2f} "
+        f"time_budget={time_budget:.2f}"
     )
 
     return ExtractBillDataResponse(
