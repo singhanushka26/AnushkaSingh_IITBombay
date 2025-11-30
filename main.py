@@ -16,9 +16,9 @@ from pdf2image import convert_from_bytes
 from PIL import Image, ImageEnhance
 from openai import OpenAI
 
-# Optional OCR (currently not used in BALANCED for speed, but kept for future tuning)
+# Optional OCR – used only for row-density heuristics (not for content)
 try:
-    import pytesseract  # noqa: F401
+    import pytesseract
 
     OCR_AVAILABLE = True
 except ImportError:
@@ -33,13 +33,13 @@ client = OpenAI(
     base_url="https://api.groq.com/openai/v1",
 )
 
-# Fast bulk model (BALANCED = Scout-only)
+# Fast bulk model (Scout)
 GROQ_VISION_MODEL_SCOUT = os.environ.get(
     "GROQ_VISION_MODEL_SCOUT",
     "meta-llama/llama-4-scout-17b-16e-instruct",
 )
 
-# NOTE: Maverick not used in this SAFE BALANCED version
+# Accurate refinement model (Maverick)
 GROQ_VISION_MODEL_MAVERICK = os.environ.get(
     "GROQ_VISION_MODEL_MAVERICK",
     "meta-llama/llama-4-maverick-17b-128e-instruct",
@@ -48,7 +48,7 @@ GROQ_VISION_MODEL_MAVERICK = os.environ.get(
 # Groq Vision limit: MAX 5 images per request
 MAX_IMAGES_PER_REQUEST = 5
 
-# Soft global time budget (not enforced, used only conceptually)
+# Soft global time budget (not enforced, only conceptual)
 GLOBAL_TIME_BUDGET_SEC = 120.0
 
 # ============================================================
@@ -96,11 +96,11 @@ class ExtractBillDataResponse(BaseModel):
 
 app = FastAPI(
     title="Bajaj Datathon Bill Extraction API",
-    version="9.0.0-safe-balanced",
+    version="10.0.0-hybrid-accuracy",
     description=(
-        "SAFE BALANCED: Scout-only bulk vision, small prompt, compact images, "
-        "no heavy refinement – optimized for stable JSON and fast latency "
-        "under the Datathon constraints."
+        "HYBRID-ACCURACY: Scout bulk + smart Maverick refinement, "
+        "higher resolution, OCR-based suspicion heuristics, "
+        "JSON-stable and time-safe under Datathon constraints."
     ),
 )
 
@@ -244,50 +244,106 @@ def jpeg_bytes_to_data_url(b: bytes) -> str:
 
 
 # ============================================================
-#  Strategy Selection (SAFE BALANCED)
+#  OCR – Rough row estimation for suspicion heuristics
+# ============================================================
+
+def estimate_table_rows(img: Image.Image) -> int:
+    """
+    Use OCR to roughly estimate how many 'rows' of content exist.
+    We only need this as a *signal* to detect under-extracted pages.
+
+    Returns:
+        int: approximate row count (lines that have some text+digits).
+    """
+    if not OCR_AVAILABLE:
+        return 0
+
+    try:
+        data = pytesseract.image_to_data(img, output_type=pytesseract.Output.DICT)
+    except Exception:
+        return 0
+
+    n = len(data.get("text", []))
+    if n == 0:
+        return 0
+
+    rows: Dict[int, Dict[str, bool]] = {}
+    for i in range(n):
+        text = (data["text"][i] or "").strip()
+        if not text:
+            continue
+        line_num = data.get("line_num", [0] * n)[i]
+        if line_num not in rows:
+            rows[line_num] = {"has_digit": False, "has_alpha": False}
+        if any(ch.isdigit() for ch in text):
+            rows[line_num]["has_digit"] = True
+        if any(ch.isalpha() for ch in text):
+            rows[line_num]["has_alpha"] = True
+
+    count = 0
+    for info in rows.values():
+        if info["has_digit"] and info["has_alpha"]:
+            count += 1
+    return count
+
+
+# ============================================================
+#  Dynamic Strategy Selection (HYBRID-ACCURACY)
 # ============================================================
 
 def choose_strategy(num_pages: int) -> Dict[str, Any]:
     """
-    SAFE BALANCED strategy:
-    - ALWAYS use Scout for bulk (fast + cheap).
-    - No Maverick refinement (to avoid extra latency + tokens).
-    - Medium–low resolution + compression to keep tokens and latency low.
-    - Small, consistent behaviour across all doc sizes.
-    """
+    HYBRID-ACCURACY strategy:
 
-    # Base defaults (good for most docs 5–20 pages)
+    - ALWAYS use Scout for bulk (fast, cheap).
+    - Higher resolution than SAFE for better table reading.
+    - Use OCR row estimation on first N pages for refinement heuristics.
+    - Use Maverick refinement on a small subset of suspicious pages.
+    """
+    # Base settings (good for 8–20 pages)
     strategy: Dict[str, Any] = {
         "bulk_model": GROQ_VISION_MODEL_SCOUT,
-        "bulk_batch_size": 3,   # balanced TPS vs latency
-        "bulk_max_dim": 850,    # slightly smaller → fewer tokens
-        "contrast": 1.4,
-        "sharpness": 1.3,
-        "jpeg_quality": 45,     # stronger compression → faster, fewer tokens
+        "bulk_batch_size": 2,       # better accuracy than 3–4
+        "bulk_max_dim": 1000,       # clearer tables than 850
+        "contrast": 1.5,
+        "sharpness": 1.4,
+        "jpeg_quality": 50,         # balanced tokens vs quality
         "use_smart_crop": True,
+        "use_ocr": True,
+        "ocr_max_pages": 20,        # run OCR only on first N pages
+        "use_refine": True,
+        "refine_model": GROQ_VISION_MODEL_MAVERICK,
+        "refine_limit": 4,          # default, adjusted below
     }
 
-    # Light tuning based on number of pages
-    if num_pages <= 4:
-        # Very small docs: can afford slightly higher resolution
+    if num_pages <= 6:
+        # Small docs: can be aggressive with Maverick
         strategy["bulk_batch_size"] = 2
-        strategy["bulk_max_dim"] = 900
+        strategy["bulk_max_dim"] = 1050
+        strategy["jpeg_quality"] = 55
+        strategy["refine_limit"] = min(4, num_pages)
+        strategy["ocr_max_pages"] = num_pages
+    elif num_pages <= 12:
+        # Medium docs: refine ~half pages at most
+        strategy["bulk_batch_size"] = 2
+        strategy["bulk_max_dim"] = 1000
         strategy["jpeg_quality"] = 50
-    elif num_pages <= 10:
-        # Small/medium docs: default settings
-        strategy["bulk_batch_size"] = 3
-        strategy["bulk_max_dim"] = 850
-        strategy["jpeg_quality"] = 45
+        strategy["refine_limit"] = min(max(4, num_pages // 2), 6)
+        strategy["ocr_max_pages"] = min(20, num_pages)
     elif num_pages <= 20:
-        # Medium/large docs: slightly larger batch, lower resolution
-        strategy["bulk_batch_size"] = 3
-        strategy["bulk_max_dim"] = 820
-        strategy["jpeg_quality"] = 42
+        # Larger docs: refine ~1/3 pages
+        strategy["bulk_batch_size"] = 2
+        strategy["bulk_max_dim"] = 950
+        strategy["jpeg_quality"] = 48
+        strategy["refine_limit"] = min(max(4, num_pages // 3), 8)
+        strategy["ocr_max_pages"] = min(20, num_pages)
     else:
-        # Very large docs (20–30+ pages): keep tokens tight
-        strategy["bulk_batch_size"] = 4
-        strategy["bulk_max_dim"] = 800
-        strategy["jpeg_quality"] = 40
+        # Very large docs: keep tokens tight, limited refinement
+        strategy["bulk_batch_size"] = 3
+        strategy["bulk_max_dim"] = 900
+        strategy["jpeg_quality"] = 45
+        strategy["refine_limit"] = min(max(4, num_pages // 4), 8)
+        strategy["ocr_max_pages"] = min(25, num_pages)
 
     # Respect Groq's batch limit
     strategy["bulk_batch_size"] = min(strategy["bulk_batch_size"], MAX_IMAGES_PER_REQUEST)
@@ -299,16 +355,17 @@ def build_page_infos(
     strategy: Dict[str, Any],
 ) -> List[Dict[str, Any]]:
     """
-    Apply cropping, enhancement, resizing and JPEG encoding
+    Apply cropping, enhancement, resizing, OCR and JPEG encoding
     to all pages according to the chosen strategy.
 
     Returns:
         List[Dict]: each entry has:
             - page_index: int
             - data_url: str
-            - ocr_rows: int (kept for compatibility; always 0 in SAFE BALANCED)
+            - ocr_rows: int (approx row count)
     """
     page_infos: List[Dict[str, Any]] = []
+    ocr_max_pages = strategy.get("ocr_max_pages", 0)
 
     for idx, img in enumerate(raw_pages):
         img_proc = img.convert("RGB")
@@ -316,16 +373,25 @@ def build_page_infos(
             img_proc = smart_crop(img_proc)
         img_proc = enhance_image(
             img_proc,
-            contrast_factor=strategy.get("contrast", 1.4),
-            sharpness_factor=strategy.get("sharpness", 1.3),
+            contrast_factor=strategy.get("contrast", 1.5),
+            sharpness_factor=strategy.get("sharpness", 1.4),
         )
         img_proc = resize_image_max_dim(
-            img_proc, strategy.get("bulk_max_dim", 850)
+            img_proc, strategy.get("bulk_max_dim", 1000)
         )
+
+        # OCR row estimation (limited to first ocr_max_pages for speed)
+        ocr_rows = 0
+        if (
+            strategy.get("use_ocr", True)
+            and OCR_AVAILABLE
+            and idx < ocr_max_pages
+        ):
+            ocr_rows = estimate_table_rows(img_proc)
 
         jpeg_bytes = image_to_jpeg_bytes(
             img_proc,
-            quality=strategy.get("jpeg_quality", 45),
+            quality=strategy.get("jpeg_quality", 50),
         )
         data_url = jpeg_bytes_to_data_url(jpeg_bytes)
 
@@ -333,36 +399,45 @@ def build_page_infos(
             {
                 "page_index": idx,
                 "data_url": data_url,
-                "ocr_rows": 0,  # OCR disabled in SAFE BALANCED for speed
+                "ocr_rows": ocr_rows,
             }
         )
     return page_infos
 
 
 # ============================================================
-#  LLM Prompts – Compact BULK prompt
+#  LLM Prompts – BULK + REFINEMENT
 # ============================================================
 
 SYSTEM_PROMPT_BULK = """
 You are an expert hospital BILL ITEM extraction engine.
 
-Task:
-- For each page image, read all charge tables.
+Task (BATCH MODE):
+- You will receive a BATCH of page images from a hospital bill.
+- For EACH page image, read all charge tables on that page only.
 - For EVERY visible row that is a real charge (description + amount),
   output ONE entry in bill_items.
-- DO NOT output totals, sub-totals, discounts, taxes, or summary rows.
-- DO NOT output headings or empty rows.
-- DO NOT output any commentary. JSON only.
+- Do NOT output:
+  - totals, sub-totals, grand totals,
+  - net payable, discounts, taxes,
+  - headings, captions, or empty rows.
+- No commentary. JSON only.
 
 Numeric rules:
-- item_quantity: from columns like Qty, No. of days, Units, etc.
-- item_rate:     from Rate, Charges per day, Per unit, etc.
-- item_amount:   from Amount, Net Amount, etc.
-- If quantity missing but amount visible: quantity=1.0, rate=amount.
-- If rate missing but quantity & amount visible: rate=amount/quantity.
+- item_quantity: from Qty / Units / No. of days, etc.
+- item_rate:     from Rate / Charges per day / per unit, etc.
+- item_amount:   from Amount / Net Amount / Net Amt, etc.
+- If quantity missing but amount visible: quantity = 1.0, rate = amount.
+- If rate missing but quantity & amount visible: rate = amount / quantity.
 - If a numeric field is unreadable: 0.0.
 
-You must follow this EXACT JSON schema:
+Repeat rows:
+- If the SAME row appears multiple times as separate lines
+  (e.g. multiple IP CONSULTATION CHARGES with same numbers),
+  you MUST output one bill_items entry per visible row.
+- Do NOT collapse repeated charge rows.
+
+Required JSON schema for the WHOLE BATCH:
 
 {
   "pagewise_line_items": [
@@ -383,9 +458,56 @@ You must follow this EXACT JSON schema:
 }
 
 Rules:
-- JSON ONLY. No ```json, no text outside the JSON object.
-- Do NOT add extra top-level keys.
+- JSON ONLY. No ```json, no markdown, no comments.
+- No extra top-level keys.
+- page_no is the 1-based index WITHIN THIS BATCH as a STRING.
 - total_item_count = total number of bill_items across all pages IN THIS BATCH.
+"""
+
+SYSTEM_PROMPT_REFINEMENT = """
+You are a precise hospital BILL ITEM extraction engine.
+
+Task (SINGLE PAGE):
+- You will see exactly ONE hospital bill page image.
+- Read ALL charge tables on this page.
+- For EVERY visible row that is a real charge (description + amount),
+  output ONE entry in bill_items.
+- Do NOT output totals, sub-totals, grand totals, net payable, discounts,
+  taxes, headings, or empty rows.
+- Do NOT output any commentary. JSON only.
+
+Numeric rules:
+- item_quantity: from Qty / Units / No. of days, etc.
+- item_rate:     from Rate / Charges per day / per unit, etc.
+- item_amount:   from Amount / Net Amount / Net Amt, etc.
+- If quantity missing but amount visible: quantity = 1.0, rate = amount.
+- If rate missing but quantity & amount visible: rate = amount / quantity.
+- If a numeric field is unreadable: 0.0.
+
+Required JSON schema for this SINGLE PAGE:
+
+{
+  "pagewise_line_items": [
+    {
+      "page_no": "1",
+      "page_type": "Bill Detail" | "Final Bill" | "Pharmacy",
+      "bill_items": [
+        {
+          "item_name": "<string>",
+          "item_amount": <float>,
+          "item_rate": <float>,
+          "item_quantity": <float>
+        }
+      ]
+    }
+  ],
+  "total_item_count": <integer>
+}
+
+Rules:
+- JSON ONLY. No markdown, no comments.
+- No extra top-level keys.
+- total_item_count = number of bill_items for this page.
 """
 
 # ============================================================
@@ -403,7 +525,6 @@ def extract_text_from_response(response: Any) -> str:
         return response.output_text
 
     try:
-        # Fallback for generic Responses schema
         output_blocks = getattr(response, "output", None)
         if output_blocks and len(output_blocks) > 0:
             first_block = output_blocks[0]
@@ -420,6 +541,7 @@ def extract_text_from_response(response: Any) -> str:
         status_code=500,
         detail="LLM response does not contain text output.",
     )
+
 
 # ============================================================
 #  JSON Parsing with Self-Repair
@@ -479,7 +601,6 @@ def parse_llm_json(raw_text: str, src: str) -> Any:
             except Exception:
                 pass
 
-        # If still failing, raise controlled HTTPException
         snippet = sanitized[:200].replace("\n", " ")
         raise HTTPException(
             status_code=500,
@@ -488,7 +609,7 @@ def parse_llm_json(raw_text: str, src: str) -> Any:
 
 
 # ============================================================
-#  LLM Call Helpers – BULK (Scout-only)
+#  LLM Call Helpers – BULK + REFINEMENT
 # ============================================================
 
 def call_groq_for_batch(
@@ -602,6 +723,91 @@ For EACH batch page i (1-based), you must:
     return raw_pages, token_usage
 
 
+def call_groq_for_single_page_refine(
+    page_info: Dict[str, Any],
+    model_id: str,
+) -> Tuple[Dict[str, Any], TokenUsage]:
+    """
+    Single-page refinement using Maverick (or any precise model).
+    Returns:
+        - raw_page: one dict with page_no="1", page_type, bill_items
+        - token_usage: TokenUsage for this call
+    """
+    user_content: List[Dict[str, Any]] = [
+        {
+            "type": "input_text",
+            "text": "This is a single hospital bill page. Extract all charge line items only.",
+        },
+        {
+            "type": "input_image",
+            "image_url": page_info["data_url"],
+            "detail": "high",
+        },
+    ]
+
+    try:
+        response = client.responses.create(
+            model=model_id,
+            input=[
+                {
+                    "role": "system",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": SYSTEM_PROMPT_REFINEMENT.strip(),
+                        }
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": user_content,
+                },
+            ],
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Groq API error (refine single-page): {e}",
+        )
+
+    usage = getattr(response, "usage", None)
+    if usage is not None:
+        total_tokens = int(getattr(usage, "total_tokens", 0) or 0)
+        input_tokens = int(getattr(usage, "input_tokens", 0) or 0)
+        output_tokens = int(getattr(usage, "output_tokens", 0) or 0)
+    else:
+        total_tokens = input_tokens = output_tokens = 0
+
+    token_usage = TokenUsage(
+        total_tokens=total_tokens,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+    )
+
+    raw_text = extract_text_from_response(response)
+    parsed = parse_llm_json(raw_text, src="Refine model")
+
+    if isinstance(parsed, dict) and "pagewise_line_items" in parsed:
+        raw_pages = parsed.get("pagewise_line_items", []) or []
+    elif isinstance(parsed, list):
+        raw_pages = parsed
+    else:
+        raise HTTPException(
+            status_code=500,
+            detail="Refine JSON does not contain 'pagewise_line_items' list.",
+        )
+
+    if not raw_pages:
+        raise HTTPException(
+            status_code=500,
+            detail="Refine JSON returned empty pagewise_line_items.",
+        )
+
+    # Use first page only (this call is strictly single-page)
+    raw_page = raw_pages[0]
+    return raw_page, token_usage
+
+
 # ============================================================
 #  Reconcile, Clean & Aggregate
 # ============================================================
@@ -630,7 +836,7 @@ def clean_page_dict(page_dict: Dict[str, Any]) -> Dict[str, Any]:
     fail when numeric fields are null/empty/etc.
 
     IMPORTANT: We DO NOT dedupe within a page here – multiple identical rows
-    (e.g. many IP CONSULTATION CHARGES) must be preserved as separate items.
+    must be preserved as separate items.
     """
     bill_items = page_dict.get("bill_items", []) or []
     cleaned_items: List[Dict[str, Any]] = []
@@ -780,7 +986,7 @@ def health_check():
 
 
 # ============================================================
-#  Main Datathon Endpoint (POST) – SAFE BALANCED
+#  Main Datathon Endpoint (POST) – HYBRID-ACCURACY
 # ============================================================
 
 @app.post("/extract-bill-data", response_model=ExtractBillDataResponse)
@@ -806,11 +1012,11 @@ def extract_bill_data(req: ExtractBillDataRequest):
             message="No pages/images could be extracted from the document.",
         )
 
-    # 3. Choose SAFE BALANCED strategy & build page_infos
+    # 3. Choose HYBRID-ACCURACY strategy & build page_infos
     strategy = choose_strategy(num_pages)
     page_infos = build_page_infos(raw_pages, strategy)
 
-    # 4. Bulk pass – process pages in batches (Scout-only)
+    # 4. Bulk pass – process pages in batches (Scout)
     all_pages: List[PageItems] = []
     total_tokens = 0
     input_tokens = 0
@@ -854,10 +1060,78 @@ def extract_bill_data(req: ExtractBillDataRequest):
             message="Model did not return any page items.",
         )
 
-    # 5. SECOND PASS – fill numeric gaps using global patterns
+    # 5. Maverick refinement on suspicious pages (capped)
+    if strategy.get("use_refine", True) and strategy.get("refine_limit", 0) > 0:
+        suspicious_indices: List[int] = []
+        scores: List[Tuple[int, float]] = []  # (idx, score) higher = more suspicious
+
+        for idx, p in enumerate(all_pages):
+            ocr_rows = page_infos[idx].get("ocr_rows", 0)
+            n_items = len(p.bill_items)
+            page_type = (p.page_type or "").strip().lower()
+
+            # Heuristics
+            # - very_sparse: OCR indicates many text rows but few items
+            # - almost_empty: OCR shows content but 0–1 items
+            # - suspicious_final: final bill with unusually few items
+            # - pharmacy_sparse: pharmacy page with low items vs OCR rows
+            very_sparse = (ocr_rows >= 10 and n_items <= max(3, ocr_rows // 3))
+            almost_empty = (ocr_rows >= 6 and n_items <= 1)
+            suspicious_final = (page_type == "final bill" and n_items < 8)
+            pharmacy_sparse = (
+                page_type == "pharmacy"
+                and ocr_rows >= 8
+                and n_items < max(4, ocr_rows // 2)
+            )
+
+            # Score: higher = more worth refining
+            score = 0.0
+            if very_sparse:
+                score += 3.0 + max(0, ocr_rows - n_items)
+            if almost_empty:
+                score += 4.0 + ocr_rows
+            if suspicious_final:
+                score += 3.0
+            if pharmacy_sparse:
+                score += 2.0 + (ocr_rows - n_items) * 0.5
+
+            # Small bonus for pages with large difference ocr_rows - n_items
+            if ocr_rows > 0:
+                score += max(0, ocr_rows - n_items) * 0.2
+
+            if score > 0:
+                scores.append((idx, score))
+
+        # Sort by descending score & pick top-K
+        scores.sort(key=lambda x: x[1], reverse=True)
+        refine_limit = strategy["refine_limit"]
+        suspicious_indices = [idx for idx, _ in scores[:refine_limit]]
+
+        for idx in suspicious_indices:
+            try:
+                raw_page_ref, usage_ref = call_groq_for_single_page_refine(
+                    page_infos[idx],
+                    model_id=strategy["refine_model"],
+                )
+            except HTTPException as e:
+                print(f"[REFINE_SKIP] page={idx+1} reason={e.detail}")
+                continue
+            except Exception as e:
+                print(f"[REFINE_SKIP] page={idx+1} unexpected_error={e}")
+                continue
+
+            total_tokens += usage_ref.total_tokens
+            input_tokens += usage_ref.input_tokens
+            output_tokens += usage_ref.output_tokens
+
+            raw_page_ref["page_no"] = str(idx + 1)
+            refined_page = reconcile_page_items(raw_page_ref)
+            all_pages[idx] = refined_page
+
+    # 6. SECOND PASS – fill numeric gaps using global patterns
     all_pages = enrich_from_patterns(all_pages)
 
-    # 6. Aggregate
+    # 7. Aggregate
     data = aggregate_all_pages(all_pages)
 
     token_usage = TokenUsage(
@@ -866,7 +1140,7 @@ def extract_bill_data(req: ExtractBillDataRequest):
         output_tokens=output_tokens,
     )
 
-    # 7. Logging
+    # 8. Logging
     grand_total = compute_grand_total_amount(all_pages)
     elapsed = time.time() - start_time
 
