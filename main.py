@@ -317,8 +317,8 @@ def choose_strategy(num_pages: int) -> Dict[str, Any]:
 
     # Small docs: push accuracy hard
     if num_pages <= 6:
-        strategy["bulk_batch_size"] = 2
-        strategy["bulk_max_dim"] = 950
+        strategy["bulk_batch_size"] = 1
+        strategy["bulk_max_dim"] = 1100
         strategy["jpeg_quality"] = 52
         strategy["ocr_max_pages"] = num_pages
         strategy["refine_limit"] = min(4, num_pages)
