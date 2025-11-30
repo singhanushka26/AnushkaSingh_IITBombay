@@ -36,7 +36,7 @@ client = OpenAI(
 # Fast bulk model (always used for BALANCED)
 GROQ_VISION_MODEL_SCOUT = os.environ.get(
     "GROQ_VISION_MODEL_SCOUT",
-    "meta-llama/llama-4-scout-mini-8b-instruct",
+    "meta-llama/llama-4-scout-17b-16e-instruct",
 )
 
 # Accurate refinement / heavy model (only for a few pages)
