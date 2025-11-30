@@ -1,10 +1,10 @@
-# 🚀 Bajaj Finserv Datathon – Hybrid Vision + OCR Bill Extraction API
+# Bajaj Finserv Datathon – Hybrid Vision + OCR Bill Extraction API
 
 ### **High-Accuracy Hospital Bill Parsing using Groq Vision Models + OCR + Multi-Stage Refinement**
 
 ---
 
-## 📌 **1. Project Overview**
+##   **1. Project Overview**
 
 This project implements a **high-accuracy** hospital bill extraction API built specifically for the **Bajaj Finserv Datathon**. It converts multi-page hospital bills (PDFs or images) into clean, structured JSON following the exact competition schema.
 
@@ -22,7 +22,7 @@ The entire pipeline is optimized to deliver high accuracy while remaining robust
 
 ---
 
-## 📌 **2. End-to-End Architecture Diagram**
+##   **2. End-to-End Architecture Diagram**
 
 ```
              ┌────────────────────────────┐
@@ -96,7 +96,7 @@ The entire pipeline is optimized to deliver high accuracy while remaining robust
 
 ---
 
-## 📌 **3. Technology Stack**
+##   **3. Technology Stack**
 
 ### **AI Models (Groq LPU Inference)**
 
@@ -121,7 +121,7 @@ The entire pipeline is optimized to deliver high accuracy while remaining robust
 
 ---
 
-## 📌 **4. Pipeline Logic**
+##   **4. Pipeline Logic**
 
 ### **1. Bulk Extraction (Scout)**
 
@@ -173,7 +173,7 @@ Produces:
 
 ---
 
-## 📌 **5. API Routes**
+## **5. API Routes**
 
 ### **GET /extract-bill-data**
 
@@ -221,7 +221,7 @@ Response:
 
 ---
 
-## 📌 **6. Project Structure**
+## **6. Project Structure**
 
 ```
 .
@@ -235,7 +235,7 @@ Response:
 
 ---
 
-## 📌 **7. Why This Pipeline Works Well**
+## **7. Why This Pipeline Works Well**
 
 * Dual-stage extraction: fast + accurate
 * OCR used only for structural cues (fast, not heavy OCR)
@@ -246,7 +246,7 @@ Response:
 
 ---
 
-## 📌 **8. Future Enhancements**
+## **8. Future Enhancements**
 
 * Bounding-box extraction
 * Table segmentation model
@@ -256,6 +256,6 @@ Response:
 
 ---
 
-## 🎉 Final Notes
+## Final Notes
 
 This README represents the architecture exactly as implemented in the provided `main.py`. All core components, design choices, algorithms, and hybrid refinements are documented precisely and cleanly.
