@@ -258,10 +258,9 @@ Response:
 ---
 
 ## **9. Contact**
-* Field	 Value
-* Name	 Anushka
-* Email	 22b0714@iitb.ac.in
-* College  IT Bombay
+* Name:     Anushka
+* Email:    22b0714@iitb.ac.in
+* College:  IT Bombay
 ---
 
 ## Final Notes
