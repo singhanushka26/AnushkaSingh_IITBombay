@@ -16,7 +16,7 @@ from pdf2image import convert_from_bytes
 from PIL import Image, ImageEnhance
 from openai import OpenAI
 
-# Optional OCR (used in HYBRID A+ Safe, but limited for speed)
+# Optional OCR 
 try:
     import pytesseract
 
@@ -98,7 +98,7 @@ app = FastAPI(
     title="Bajaj Datathon Bill Extraction API",
     version="10.0.0-hybrid-a-plus-safe",
     description=(
-        "HYBRID-ACCURACY A+ Safe: Scout bulk + Maverick refinement on "
+        "HYBRID- ACCURACY + SAFE: Scout bulk + Maverick refinement on "
         "top ~60% most suspicious pages, OCR-lite row heuristics, robust "
         "JSON repair – tuned to stay under ~120s even for larger docs."
     ),
@@ -288,12 +288,12 @@ def estimate_table_rows(img: Image.Image) -> int:
 
 
 # ============================================================
-#  Strategy Selection (HYBRID A+ Safe)
+#  Strategy Selection (HYBRID)
 # ============================================================
 
 def choose_strategy(num_pages: int) -> Dict[str, Any]:
     """
-    HYBRID A+ Safe strategy:
+    HYBRID strategy:
 
     - Scout for ALL bulk pages (fast + cheap).
     - Maverick refinement on ~60% most suspicious pages (capped).
@@ -970,7 +970,7 @@ def health_check():
 
 
 # ============================================================
-#  Main Datathon Endpoint (POST) – HYBRID A+ Safe
+#  Main Datathon Endpoint (POST) – HYBRID
 # ============================================================
 
 @app.post("/extract-bill-data", response_model=ExtractBillDataResponse)
@@ -996,7 +996,7 @@ def extract_bill_data(req: ExtractBillDataRequest):
             message="No pages/images could be extracted from the document.",
         )
 
-    # 3. Choose HYBRID A+ Safe strategy & build page_infos
+    # 3. Choose HYBRID strategy & build page_infos
     strategy = choose_strategy(num_pages)
     page_infos = build_page_infos(raw_pages, strategy)
 
@@ -1044,7 +1044,7 @@ def extract_bill_data(req: ExtractBillDataRequest):
             message="Model did not return any page items.",
         )
 
-    # 5. Maverick refinement on most suspicious pages (A+ Safe)
+    # 5. Maverick refinement on most suspicious pages 
     if strategy.get("use_refine", True) and strategy.get("refine_limit", 0) > 0:
         refine_limit = strategy["refine_limit"]
         suspicious_scores: List[Tuple[int, float]] = []

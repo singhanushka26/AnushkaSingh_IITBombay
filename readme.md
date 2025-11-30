@@ -1,40 +1,41 @@
-# 🚀 Bajaj Finserv HackRx – Hybrid A+ SAFE Bill Extraction API
+# 🚀 Bajaj Finserv Datathon – Hybrid Vision + OCR Bill Extraction API
 
-### **High-Accuracy Hospital Bill Parsing using Groq Vision + OCR + Multi‑Stage Refinement**
-
----
-
-## 📌 **1. Overview**
-
-This project implements a **high‑accuracy, time‑bounded (≤120s)** hospital bill extraction API built for the **Bajaj Finserv HackRx Datathon**. The system converts multi‑page PDFs or images into structured Datathon‑compliant JSON using a **multi‑stage hybrid pipeline**:
-
-* **Scout Vision Model (Fast Pass)** to extract all pages quickly.
-* **Suspicion Scoring** to detect under‑extracted or ambiguous pages.
-* **Maverick Vision Model (Refinement Pass)** to reprocess ~40–70% problematic pages.
-* **OCR‑Lite Row Estimation** to judge extraction completeness.
-* **Two‑Stage Numeric Repair** for missing or inconsistent amounts/rates/quantities.
-* **Robust JSON self‑healing** for malformed LLM output.
-
-This pipeline is designed from scratch to **maximize accuracy while staying within Groq inference limits and real datathon constraints**.
+### **High-Accuracy Hospital Bill Parsing using Groq Vision Models + OCR + Multi-Stage Refinement**
 
 ---
 
-## 📌 **2. End‑to‑End System Architecture**
+## 📌 **1. Project Overview**
 
-Below is a clean, structured, ASCII‑style block diagram representing the full flow exactly as implemented in the provided `main.py`.
+This project implements a **high-accuracy** hospital bill extraction API built specifically for the **Bajaj Finserv Datathon**. It converts multi-page hospital bills (PDFs or images) into clean, structured JSON following the exact competition schema.
+
+The system uses a **hybrid multi-stage pipeline** combining:
+
+* **Groq Vision – Scout Model** for bulk extraction (fast)
+* **Groq Vision – Maverick Model** for selective refinement (accurate)
+* **OCR-Lite row estimation** to detect missing line items
+* **Robust image preprocessing pipeline** (crop + enhance + resize)
+* **Automatic numeric repair engine** for fixing missing/inconsistent values
+* **Global pattern enrichment** to fill rates/qty using learned statistics
+* **Fully self-healing JSON parser** to recover from malformed LLM output
+
+The entire pipeline is optimized to deliver high accuracy while remaining robust across noisy scans, multi-table layouts, and large multi-page documents.
+
+---
+
+## 📌 **2. End-to-End Architecture Diagram**
 
 ```
              ┌────────────────────────────┐
-             │       Public Document URL   │
+             │       Public Document URL  │
              └───────────────┬────────────┘
                              ▼
-                ┌────────────────────────┐
+                ┌─────────────────────────┐
                 │  Download (HTTP GET)    │
                 └──────────────┬──────────┘
                                ▼
                 ┌────────────────────────┐
                 │   PDF/Image Loader      │
-                │  (Poppler / PIL Image)  │
+                │   (pdf2image / PIL)     │
                 └──────────────┬──────────┘
                                ▼
         ┌───────────────────────────────────────────────┐
@@ -42,9 +43,9 @@ Below is a clean, structured, ASCII‑style block diagram representing the full 
         │  - smart_crop()                               │
         │  - enhance_image() (contrast + sharpness)     │
         │  - resize_image_max_dim()                     │
-        │  - JPEG encode (≤4MB)                          │
-        │  - OCR-lite (row estimation for suspicion)    │
-        └──────────────┬─────────────────────────────────┘
+        │  - JPEG encode (≤4MB)                         │
+        │  - OCR-Lite (row estimation)                  │
+        └──────────────┬────────────────────────────────┘
                        ▼
           ┌─────────────────────────────┐
           │  BULK PASS (Scout Vision)   │
@@ -55,21 +56,21 @@ Below is a clean, structured, ASCII‑style block diagram representing the full 
   ┌─────────────────────────────────────────────────────┐
   │ Suspicion Analyzer                                  │
   │  - OCR rows vs extracted rows                       │
-  │  - Very sparse pages                                │
+  │  - Sparse pages                                     │
   │  - Final Bill / Pharmacy pages                      │
-  │  - Last pages of PDF                                │
+  │  - Last pages                                       │
   │  - Zero-amount pages with OCR text                  │
   └──────────────┬──────────────────────────────────────┘
                  ▼
         ┌───────────────────────────────────┐
         │  MAVERICK REFINEMENT PASS         │
         │  - Reprocess top 40–70% pages     │
-        │  - High-resolution / high-accuracy│
+        │  - High-resolution, high-accuracy │
         └──────────────┬────────────────────┘
                        ▼
-    ┌────────────────────────────────────────────┐
+    ┌─────────────────────────────────────────────┐
     │ Cleaning + JSON Reconciliation              │
-    │  - Coerce numbers (empty, '-', None → 0)    │
+    │  - Coerce numbers                           │
     │  - Infer qty/rate when missing              │
     │  - amount = rate × qty correction           │
     └──────────────┬──────────────────────────────┘
@@ -95,118 +96,92 @@ Below is a clean, structured, ASCII‑style block diagram representing the full 
 
 ---
 
-## 📌 **3. Tech Stack & Components**
+## 📌 **3. Technology Stack**
 
-### **Core Technologies**
+### **AI Models (Groq LPU Inference)**
 
-* **FastAPI** → API server
-* **Pydantic v2** → strict validation & schema enforcement
-* **Pillow (PIL)** → image preprocessing
-* **pdf2image + Poppler** → PDF → Image conversion
-* **Tesseract** → lightweight OCR for row estimation
-* **Groq LPU Inference Engine** via OpenAI SDK wrapper
+* **Fast Extraction:** `meta-llama/llama-4-scout-17b-16e-instruct`
+* **Accurate Refinement:** `meta-llama/llama-4-maverick-17b-128e-instruct`
 
-### **AI Models (OpenAI-compatible Groq Vision)**
+### **Backend**
 
-* **Scout Model (Fast)**: `meta-llama/llama-4-scout-17b-16e-instruct`
-* **Maverick Model (Accurate)**: `meta-llama/llama-4-maverick-17b-128e-instruct`
+* FastAPI
+* Pydantic v2
+* Python 3.10+
 
-Each model call is handled using Groq’s `client.responses.create()` with both text + images supported.
+### **Vision & Processing**
 
----
+* Pillow (PIL)
+* pdf2image (uses pdf2image’s internal engine)
+* Tesseract OCR for row estimation
 
-## 📌 **4. Hybrid A+ SAFE Extraction Strategy**
+### **Networking**
 
-The strategy implemented in `choose_strategy()` dynamically adapts to document size.
-
-### **For small PDFs (≤4 pages)**
-
-* Higher resolution
-* Aggressive enhancement
-* Refinement up to 3 pages
-
-### **For medium PDFs (5–10 pages)**
-
-* Refine ~70% of pages
-* Moderate resolution
-
-### **For large PDFs (11–20 pages)**
-
-* Cap refinement to 12 pages
-* Balanced enhancement
-
-### **For very large PDFs (>20 pages)**
-
-* Batch size increased
-* Lower resolution
-* Refinement capped tightly for speed
-
-This adaptive strategy ensures:
-
-* **High accuracy on dense bills**
-* **Speed safety under 120 seconds**
+* Requests (for downloading public URLs)
 
 ---
 
-## 📌 **5. Suspicion Scoring Logic**
+## 📌 **4. Pipeline Logic**
 
-Each page gets a weighted score based on:
+### **1. Bulk Extraction (Scout)**
 
-### 🔹 **1. OCR rows vs extracted row mismatch**
+* Processes all pages quickly
+* Medium-high resolution
+* Extracts initial line items
+* Minimal latency
 
-* If OCR sees 10+ rows but only 2 items extracted → highly suspicious
+### **2. Suspicion Scoring**
 
-### 🔹 **2. Sparse pages**
+Each page is scored using:
 
-* Pages with ≤2 items + visible text
+* OCR rows vs extracted items mismatch
+* Sparse bill items
+* Page type (Final Bill, Pharmacy)
+* Last pages of PDF
+* Pages with zero amount but visible OCR text
 
-### 🔹 **3. Page types**
+### **3. Refinement (Maverick)**
 
-* `Final Bill` & `Pharmacy` are often dense → higher suspicion
+* Re-extract ~40–70% most suspicious pages
+* Much higher accuracy
+* Better structure recognition
+* Fixes missed rows, wrong splits, numeric misreads
 
-### 🔹 **4. Last few pages**
+### **4. Cleaning & Reconciliation**
 
-* End pages frequently contain totals & missed rows
+The system actively repairs:
 
-### 🔹 **5. Zero-amount pages**
+* Missing numeric values
+* Incorrect amount vs rate×qty
+* Empty fields (`''`, None, '-', '—')
+* Schema normalization
 
-* If OCR detects text → extraction likely failed
+### **5. Pattern Enrichment**
 
-Top‑scoring pages are refined using Maverick.
+Learns global patterns across all pages:
 
----
+* Most frequent rate for each item name
+* Most frequent quantity
+* Fills missing data consistently
 
-## 📌 **6. JSON Healing & Numeric Repair Engine**
+### **6. Final Aggregation**
 
-### ✔ Removes malformed structures:
+Produces:
 
-* ```json fenced blocks
-  ```
-* stray commas
-* `NaN`, `Infinity`, `-Infinity`
-
-### ✔ Repairs numeric fields:
-
-* Empty / dash / None → `0.0`
-* If amount missing → compute `rate × qty`
-* If rate missing → compute `amount ÷ qty`
-* If qty missing → assume `1.0`
-
-### ✔ Cross‑page pattern enrichment:
-
-If many rows share the same item name:
-
-* average rate is learned
-* average qty is learned
-* Missing values filled consistently
+* `pagewise_line_items` (per page extraction)
+* `total_item_count`
 
 ---
 
-## 📌 **7. API Specification**
+## 📌 **5. API Routes**
+
+### **GET /extract-bill-data**
+
+Returns API health message.
 
 ### **POST /extract-bill-data**
 
-Input:
+Request:
 
 ```json
 {
@@ -214,72 +189,70 @@ Input:
 }
 ```
 
-Output (Datathon format):
+Response:
 
 ```json
 {
-  "is_success": true,
-  "token_usage": { ... },
-  "data": {
-    "pagewise_line_items": [
-      {
-        "page_no": "1",
-        "page_type": "Bill Detail",
-        "bill_items": [
-          {
-            "item_name": "Accomodation Charges - ICU",
-            "item_rate": 3000.0,
-            "item_quantity": 2.0,
-            "item_amount": 6000.0
-          }
-        ]
-      }
-    ],
-    "total_item_count": 32
-  }
+        "is_success": "boolean", // If Status code 200 and following valid schema, then true
+        "token_usage": {
+            "total_tokens": "integer", // Cumulative Tokens from all LLM calls
+            "input_tokens": "integer", // Cumulative Tokens from all LLM calls
+            "output_tokens": "integer" // Cumulative Tokens from all LLM calls
+        },
+        "data": {
+            "pagewise_line_items": [
+            {
+                "page_no": "string",
+                "page_type": "Bill Detail | Final Bill | Pharmacy",
+                "bill_items": [
+                {
+                    "item_name": "string", // Exactly as mentioned in the bill
+                    "item_amount": "float", // Net Amount of the item post discounts as mentioned in the bill
+                    "item_rate": "float", // Exactly as mentioned in the bill
+                    "item_quantity": "float" // Exactly as mentioned in the bill
+                }
+                ]
+            }
+            ],
+            "total_item_count": "integer" // Count of items across all pages
+        }
 }
 ```
 
-### **GET /extract-bill-data (Health Check)**
-
-Returns simple API status.
-
 ---
 
-## 📌 **8. Project Structure**
+## 📌 **6. Project Structure**
 
 ```
 .
-├── main.py                  # Full Hybrid A+ SAFE pipeline
-├── Dockerfile               # For container deployment
-├── Procfile                 # For Railway deployment
-├── requirements.txt         # Python dependencies
-├── readme.md                # (this document)
+├── main.py
+├── Dockerfile
+├── Procfile
+├── requirements.txt
+├── readme.md
 └── .gitignore
 ```
 
 ---
 
-## 📌 **9. Key Strengths of My Implementation**
+## 📌 **7. Why This Pipeline Works Well**
 
-* Purpose-built for HackRx datathon constraints
-* High accuracy with dual-model hybrid flow
-* Time-safe (sub‑120 seconds)
-* JSON self-healing prevents API failures
-* Uses OCR only for structural cues (fast)
-* Automatic numeric consistency engine
-* Strong fault tolerance for noisy PDFs
-* Adaptive strategy based on page count
+* Dual-stage extraction: fast + accurate
+* OCR used only for structural cues (fast, not heavy OCR)
+* Handles noisy scans, shadows, multiple tables
+* JSON self-healing prevents model failures
+* Global patterns ensure consistent numeric reconstruction
+* Adaptive strategy based on number of pages
 
 ---
 
-## 📌 **10. Future Enhancements**
+## 📌 **8. Future Enhancements**
 
-* Integration of bounding-box extraction
-* Table detection using segmentation models
-* Parallel refinement calls for speed
-* Noise-aware OCR boosting
-* Option for Extreme Accuracy Mode (full Maverick)
+* Bounding-box extraction
+* Table segmentation model
+* Full-page semantic segmentation
+* Parallel refinement calls
+* Faster image downscaling & compression
 
 ---
 
