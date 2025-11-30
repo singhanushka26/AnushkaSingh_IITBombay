@@ -1,145 +1,225 @@
-# 🚀 Bajaj Finserv HackRx – Bill Extraction API
+# 🚀 Bajaj Finserv HackRx – Hybrid A+ SAFE Bill Extraction API
 
-### **Hybrid Vision + OCR Pipeline (Scout + Maverick + OCR-Lite)**
-
-High-Accuracy, 120s-Safe, Robust JSON Extraction
+### **High-Accuracy Hospital Bill Parsing using Groq Vision + OCR + Multi‑Stage Refinement**
 
 ---
 
-## 📌 **1. Project Overview**
+## 📌 **1. Overview**
 
-This project solves the Bajaj Finserv HackRx Datathon problem by automatically extracting structured line-item data from multi-page hospital bills.
+This project implements a **high‑accuracy, time‑bounded (≤120s)** hospital bill extraction API built for the **Bajaj Finserv HackRx Datathon**. The system converts multi‑page PDFs or images into structured Datathon‑compliant JSON using a **multi‑stage hybrid pipeline**:
 
-It handles:
+* **Scout Vision Model (Fast Pass)** to extract all pages quickly.
+* **Suspicion Scoring** to detect under‑extracted or ambiguous pages.
+* **Maverick Vision Model (Refinement Pass)** to reprocess ~40–70% problematic pages.
+* **OCR‑Lite Row Estimation** to judge extraction completeness.
+* **Two‑Stage Numeric Repair** for missing or inconsistent amounts/rates/quantities.
+* **Robust JSON self‑healing** for malformed LLM output.
 
-* Variable bill layouts
-* Multiple page types (Bill Detail / Pharmacy / Final Bill)
-* Noisy scans
-* Missing numeric fields
-* Multi-table pages
-* Large PDFs up to 20+ pages
-
-The system returns **strict Datathon-compliant JSON** with:
-
-* `pagewise_line_items` (page_no, page_type, bill_items)
-* `total_item_count`
-
-The core pipeline uses:
-
-* **Groq LLaMA-4 Scout Vision** → Fast bulk extraction
-* **Groq LLaMA-4 Maverick Vision** → Accurate refinement
-* **OCR-Lite** → Row counting for under-extraction detection
-* **Pattern-based numeric repair** → Fix missing rate/qty/amount
-* **Self-healing JSON repair** → Robust parsing of LLM outputs
+This pipeline is designed from scratch to **maximize accuracy while staying within Groq inference limits and real datathon constraints**.
 
 ---
 
-## 📌 **2. Architecture Overview**
+## 📌 **2. End‑to‑End System Architecture**
+
+Below is a clean, structured, ASCII‑style block diagram representing the full flow exactly as implemented in the provided `main.py`.
 
 ```
-Public URL → Download → PDF/Image Loader → Page Preprocessing
-
-Page Preprocessing:
-  - Smart Crop
-  - Enhancement (Contrast/Sharpness)
-  - Resize
-  - JPEG Compression (≤4MB)
-  - OCR Row Estimation
-
-Bulk Pass (Scout Vision Model):
-  - All pages processed in batches (2–4 pages)
-  - Quick extraction for entire document
-
-Suspicion Scoring:
-  - OCR rows vs extracted items
-  - Page type (Final Bill/Pharmacy)
-  - Sparse results
-  - Last pages
-  - Zero-amount pages
-
-Refinement Pass (Maverick Vision Model):
-  - Re-process top ~40–70% suspicious pages
-  - High-resolution extraction
-
-Cleaning + Reconciliation:
-  - Coerce missing numbers
-  - Fix inconsistencies (amount = rate * qty)
-
-Global Pattern Enrichment:
-  - Learn typical rate/qty for each item_name
-  - Fill missing or incorrect values
-
-Aggregation:
-  - Combine all pages
-  - Total item count
-
-Final Output → JSON (Strict Datathon Schema)
-```
-
----
-
-## 📌 **3. Tech Stack**
-
-### **Backend**
-
-* FastAPI
-* Pydantic v2
-* PIL (Pillow)
-* Poppler + pdf2image
-* Tesseract OCR (optional)
-
-### **AI Models (Groq) used**
-
-* `meta-llama/llama-4-scout-17b-16e-instruct` (Bulk)
-* `meta-llama/llama-4-maverick-17b-128e-instruct` (Refinement)
-
-### **Infra**
-
-* Railway / Render / EC2 compatible
-* Docker support included
-
----
-
-## 📌 **4. API Documentation**
-
-### **Base URL:**
-
-```
-POST /extract-bill-data
-```
-
-### **GET /extract-bill-data (Health Check)**
-
-```json
-{
-  "message": "Health OK. Use POST /extract-bill-data with JSON body {\"document\": \"<public URL>\"} to extract bill data."
-}
+             ┌────────────────────────────┐
+             │       Public Document URL   │
+             └───────────────┬────────────┘
+                             ▼
+                ┌────────────────────────┐
+                │  Download (HTTP GET)    │
+                └──────────────┬──────────┘
+                               ▼
+                ┌────────────────────────┐
+                │   PDF/Image Loader      │
+                │  (Poppler / PIL Image)  │
+                └──────────────┬──────────┘
+                               ▼
+        ┌───────────────────────────────────────────────┐
+        │ Page Preprocessing                            │
+        │  - smart_crop()                               │
+        │  - enhance_image() (contrast + sharpness)     │
+        │  - resize_image_max_dim()                     │
+        │  - JPEG encode (≤4MB)                          │
+        │  - OCR-lite (row estimation for suspicion)    │
+        └──────────────┬─────────────────────────────────┘
+                       ▼
+          ┌─────────────────────────────┐
+          │  BULK PASS (Scout Vision)   │
+          │  - Batch size = 2–4         │
+          │  - Extract ALL pages        │
+          └──────────────┬──────────────┘
+                         ▼
+  ┌─────────────────────────────────────────────────────┐
+  │ Suspicion Analyzer                                  │
+  │  - OCR rows vs extracted rows                       │
+  │  - Very sparse pages                                │
+  │  - Final Bill / Pharmacy pages                      │
+  │  - Last pages of PDF                                │
+  │  - Zero-amount pages with OCR text                  │
+  └──────────────┬──────────────────────────────────────┘
+                 ▼
+        ┌───────────────────────────────────┐
+        │  MAVERICK REFINEMENT PASS         │
+        │  - Reprocess top 40–70% pages     │
+        │  - High-resolution / high-accuracy│
+        └──────────────┬────────────────────┘
+                       ▼
+    ┌────────────────────────────────────────────┐
+    │ Cleaning + JSON Reconciliation              │
+    │  - Coerce numbers (empty, '-', None → 0)    │
+    │  - Infer qty/rate when missing              │
+    │  - amount = rate × qty correction           │
+    └──────────────┬──────────────────────────────┘
+                   ▼
+  ┌──────────────────────────────────────────────────┐
+  │ Global Pattern Enrichment                        │
+  │  - Learn typical rate per item_name              │
+  │  - Learn typical qty per item_name               │
+  │  - Fill broken / inconsistent rows               │
+  └──────────────┬───────────────────────────────────┘
+                 ▼
+  ┌──────────────────────────────────────────────────┐
+  │ Final Aggregation                                │
+  │  - pagewise_line_items                           │
+  │  - total_item_count                              │
+  └──────────────┬───────────────────────────────────┘
+                 ▼
+        ┌─────────────────────────────┐
+        │   Final JSON Response       │
+        │ (Strict Datathon Schema)    │
+        └─────────────────────────────┘
 ```
 
 ---
+
+## 📌 **3. Tech Stack & Components**
+
+### **Core Technologies**
+
+* **FastAPI** → API server
+* **Pydantic v2** → strict validation & schema enforcement
+* **Pillow (PIL)** → image preprocessing
+* **pdf2image + Poppler** → PDF → Image conversion
+* **Tesseract** → lightweight OCR for row estimation
+* **Groq LPU Inference Engine** via OpenAI SDK wrapper
+
+### **AI Models (OpenAI-compatible Groq Vision)**
+
+* **Scout Model (Fast)**: `meta-llama/llama-4-scout-17b-16e-instruct`
+* **Maverick Model (Accurate)**: `meta-llama/llama-4-maverick-17b-128e-instruct`
+
+Each model call is handled using Groq’s `client.responses.create()` with both text + images supported.
+
+---
+
+## 📌 **4. Hybrid A+ SAFE Extraction Strategy**
+
+The strategy implemented in `choose_strategy()` dynamically adapts to document size.
+
+### **For small PDFs (≤4 pages)**
+
+* Higher resolution
+* Aggressive enhancement
+* Refinement up to 3 pages
+
+### **For medium PDFs (5–10 pages)**
+
+* Refine ~70% of pages
+* Moderate resolution
+
+### **For large PDFs (11–20 pages)**
+
+* Cap refinement to 12 pages
+* Balanced enhancement
+
+### **For very large PDFs (>20 pages)**
+
+* Batch size increased
+* Lower resolution
+* Refinement capped tightly for speed
+
+This adaptive strategy ensures:
+
+* **High accuracy on dense bills**
+* **Speed safety under 120 seconds**
+
+---
+
+## 📌 **5. Suspicion Scoring Logic**
+
+Each page gets a weighted score based on:
+
+### 🔹 **1. OCR rows vs extracted row mismatch**
+
+* If OCR sees 10+ rows but only 2 items extracted → highly suspicious
+
+### 🔹 **2. Sparse pages**
+
+* Pages with ≤2 items + visible text
+
+### 🔹 **3. Page types**
+
+* `Final Bill` & `Pharmacy` are often dense → higher suspicion
+
+### 🔹 **4. Last few pages**
+
+* End pages frequently contain totals & missed rows
+
+### 🔹 **5. Zero-amount pages**
+
+* If OCR detects text → extraction likely failed
+
+Top‑scoring pages are refined using Maverick.
+
+---
+
+## 📌 **6. JSON Healing & Numeric Repair Engine**
+
+### ✔ Removes malformed structures:
+
+* ```json fenced blocks
+  ```
+* stray commas
+* `NaN`, `Infinity`, `-Infinity`
+
+### ✔ Repairs numeric fields:
+
+* Empty / dash / None → `0.0`
+* If amount missing → compute `rate × qty`
+* If rate missing → compute `amount ÷ qty`
+* If qty missing → assume `1.0`
+
+### ✔ Cross‑page pattern enrichment:
+
+If many rows share the same item name:
+
+* average rate is learned
+* average qty is learned
+* Missing values filled consistently
+
+---
+
+## 📌 **7. API Specification**
 
 ### **POST /extract-bill-data**
 
-Extract all bill items from a public image/PDF URL.
-
-#### **Request Body**
+Input:
 
 ```json
 {
-  "document": "https://your-public-url.com/bill.pdf"
+  "document": "https://public-url.com/bill.pdf"
 }
 ```
 
-#### **Successful Response**
+Output (Datathon format):
 
 ```json
 {
   "is_success": true,
-  "token_usage": {
-    "total_tokens": 24000,
-    "input_tokens": 15000,
-    "output_tokens": 9000
-  },
+  "token_usage": { ... },
   "data": {
     "pagewise_line_items": [
       {
@@ -160,175 +240,49 @@ Extract all bill items from a public image/PDF URL.
 }
 ```
 
+### **GET /extract-bill-data (Health Check)**
+
+Returns simple API status.
+
 ---
 
-## 📌 **5. JSON Schema (Datathon-Required)**
+## 📌 **8. Project Structure**
 
-### **BillItem**
-
-```json
-{
-  "item_name": "string",
-  "item_amount": 0.0,
-  "item_rate": 0.0,
-  "item_quantity": 0.0
-}
 ```
-
-### **PageItems**
-
-```json
-{
-  "page_no": "1",
-  "page_type": "Bill Detail | Final Bill | Pharmacy",
-  "bill_items": [BillItem]
-}
-```
-
-### **Final Response**
-
-```json
-{
-  "is_success": true,
-  "data": {
-    "pagewise_line_items": [...],
-    "total_item_count": 0
-  }
-}
+.
+├── main.py                  # Full Hybrid A+ SAFE pipeline
+├── Dockerfile               # For container deployment
+├── Procfile                 # For Railway deployment
+├── requirements.txt         # Python dependencies
+├── readme.md                # (this document)
+└── .gitignore
 ```
 
 ---
 
-## 📌 **6. Key Features of Hybrid A+ SAFE Strategy**
+## 📌 **9. Key Strengths of My Implementation**
 
-### **🌀 Bulk Scout Extraction**
-
-* Fast
-* Batch processing
-* Medium resolution
-
-### **🎯 Suspicion Based Refinement**
-
-Refines pages where extraction is likely incorrect:
-
-* OCR rows vs extracted items mismatch
-* Sparse pages
-* Final Bill/Pharmacy pages
-* Zero-amount pages
-* Last pages of document
-
-### **🧠 Maverick Refinement (High Accuracy)**
-
-* High resolution
-* Processes ~60% of pages
-* Fixes missed items & numeric errors
-
-### **🔢 Numeric Repair Engine**
-
-Automatically corrects:
-
-* Missing rate or qty
-* amount ≠ rate × qty
-* Invalid values (NaN, empty, Infinity)
-
-### **🔍 Pattern Learning**
-
-Learns common rate & qty for same item names across pages.
-
-### **🛡 JSON Self-Healing**
-
-Fixes:
-
-* Trailing commas
-* Broken braces
-* ```json fences
-  ```
-* NaN / Infinity
-
----
-
-## 📌 **7. Running Locally**
-
-### **Install Dependencies**
-
-```
-pip install -r requirements.txt
-```
-
-### **Environment Variable**
-
-```
-export GROQ_API_KEY="your-key"
-```
-
-### **Run the Server**
-
-```
-uvicorn main:app --host 0.0.0.0 --port 8000
-```
-
-### **Test**
-
-```
-curl -X POST http://localhost:8000/extract-bill-data \
-  -H "Content-Type: application/json" \
-  -d '{"document": "https://example.com/bill.pdf"}'
-```
-
----
-
-## 📌 **8. Deployment**
-
-Works on:
-
-* Railway
-* Render
-* AWS EC2
-* Docker
-
-Your repo already contains:
-
-* `Dockerfile`
-* `Procfile`
-* `requirements.txt`
-* `main.py`
-
----
-
-## 📌 **9. Project Structure**
-
-```
-📦 Project
- ┣ 📜 main.py
- ┣ 📜 requirements.txt
- ┣ 📜 Dockerfile
- ┣ 📜 Procfile
- ┣ 📜 readme.md
- ┗ 📜 .gitignore
-```
+* Purpose-built for HackRx datathon constraints
+* High accuracy with dual-model hybrid flow
+* Time-safe (sub‑120 seconds)
+* JSON self-healing prevents API failures
+* Uses OCR only for structural cues (fast)
+* Automatic numeric consistency engine
+* Strong fault tolerance for noisy PDFs
+* Adaptive strategy based on page count
 
 ---
 
 ## 📌 **10. Future Enhancements**
 
-* Table segmentation model
-* Bounding-box extraction
-* Parallel refinement
-* Extreme accuracy mode (Maverick-only)
-* Faster OCR pipeline
+* Integration of bounding-box extraction
+* Table detection using segmentation models
+* Parallel refinement calls for speed
+* Noise-aware OCR boosting
+* Option for Extreme Accuracy Mode (full Maverick)
 
 ---
 
-## 📌 **11. Team Details (For Datathon Submission)**
+## 🎉 Final Notes
 
-| Field       | Value                                                 |
-| ----------- | ----------------------------------------------------- |
-| **Name**    | Anushka                                               |
-| **Email**   | [your-email@domain.com](mailto:your-email@domain.com) |
-| **College** | IIT Bombay                                            |
-
----
-
-## 🎉 Done!
-
-This README is now complete and submission‑ready.
+This README represents the architecture exactly as implemented in the provided `main.py`. All core components, design choices, algorithms, and hybrid refinements are documented precisely and cleanly.
