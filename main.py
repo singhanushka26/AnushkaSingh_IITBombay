@@ -33,13 +33,13 @@ client = OpenAI(
     base_url="https://api.groq.com/openai/v1",
 )
 
-# Fast bulk model (always used for BALANCED)
+# Fast bulk model
 GROQ_VISION_MODEL_SCOUT = os.environ.get(
     "GROQ_VISION_MODEL_SCOUT",
     "meta-llama/llama-4-scout-17b-16e-instruct",
 )
 
-# Accurate refinement / heavy model (only for a few pages)
+# Accurate refinement / heavy model
 GROQ_VISION_MODEL_MAVERICK = os.environ.get(
     "GROQ_VISION_MODEL_MAVERICK",
     "meta-llama/llama-4-maverick-17b-128e-instruct",
@@ -48,7 +48,7 @@ GROQ_VISION_MODEL_MAVERICK = os.environ.get(
 # Groq Vision limit: MAX 5 images per request
 MAX_IMAGES_PER_REQUEST = 5
 
-# Hard upper time budget (sec) – just for intuition
+# Hard upper time budget (sec) – used only for strategy choice heuristics
 GLOBAL_TIME_BUDGET_SEC = 120.0
 
 # ============================================================
@@ -96,11 +96,11 @@ class ExtractBillDataResponse(BaseModel):
 
 app = FastAPI(
     title="Bajaj Datathon Bill Extraction API",
-    version="8.0.0-balanced",
+    version="9.0.0",
     description=(
-        "Balanced, time-aware bill extraction: "
-        "uses Scout for bulk and Maverick only for a few suspicious pages, "
-        "with tuned cropping, OCR and refinement to stay under ~120s even for large docs."
+        "Balanced bill extraction: dynamic strategy using Scout+Maverick, "
+        "fast preprocessing and selective refinement to maximize accuracy "
+        "under a ~120s global budget."
     ),
 )
 
@@ -188,12 +188,12 @@ def smart_crop(img: Image.Image) -> Image.Image:
     """
     Simple heuristic crop to remove headers/footers and side margins.
 
-    This is deliberately conservative:
-    - Crop ~14% top, ~8% bottom, ~4% left/right.
+    Balanced: keep more content to avoid missing top rows / totals.
+    - Crop ~10% top, ~6% bottom, ~4% left/right.
     """
     w, h = img.size
-    top = int(0.14 * h)
-    bottom = int(0.92 * h)
+    top = int(0.10 * h)
+    bottom = int(0.94 * h)
     left = int(0.04 * w)
     right = int(0.96 * w)
     if bottom <= top or right <= left:
@@ -288,49 +288,96 @@ def estimate_table_rows(img: Image.Image) -> int:
 
 
 # ============================================================
-#  Dynamic Strategy Selection (BALANCED)
+#  Dynamic Strategy Selection (Time-aware, Balanced)
 # ============================================================
 
 def choose_strategy(num_pages: int) -> Dict[str, Any]:
     """
-    Balanced strategy:
-    - ALWAYS use Scout for bulk (fast).
-    - Use medium resolution & compression.
-    - Use OCR only on first N pages.
-    - Use Maverick refinement on a small subset of suspicious pages.
+    Choose strategy based on number of pages and a global 120s budget.
+
+    Balanced design:
+    - <= 6 pages: heavy Maverick, high res (max accuracy).
+    - 7–10 pages: Maverick bulk, small batch, moderate res.
+    - 11–15 pages: Maverick bulk, larger batch, slightly lower res.
+    - > 15 pages: Scout bulk, small refinement window, lower res.
+
+    OCR is used only when it won't blow up CPU time.
     """
-    # Base BALANCED settings
+    per_page_budget = GLOBAL_TIME_BUDGET_SEC / max(1, num_pages)
+
+    # Base defaults (fast-ish)
     strategy: Dict[str, Any] = {
         "bulk_model": GROQ_VISION_MODEL_SCOUT,
-        "bulk_batch_size": 4,       # good tradeoff for most docs
-        "bulk_max_dim": 850,        # lower than 900–1050 → faster, fewer tokens
-        "contrast": 1.4,
-        "sharpness": 1.3,
-        "jpeg_quality": 45,         # more compression → fewer tokens
+        "bulk_batch_size": 3,
+        "bulk_max_dim": 900,
+        "contrast": 1.5,
+        "sharpness": 1.35,
+        "jpeg_quality": 60,
         "use_smart_crop": True,
-        "use_ocr": True,
-        "ocr_max_pages": 20,        # OCR only for first 20 pages
+        "use_ocr": False,      # enable below conditionally
         "use_refine": True,
         "refine_model": GROQ_VISION_MODEL_MAVERICK,
-        "refine_limit": 0,          # will adjust below
+        "refine_limit": 6,
     }
 
-    # Light tuning based on number of pages
+    # Very small docs – go heavy
     if num_pages <= 6:
-        # Small docs: can refine more pages
-        strategy["bulk_batch_size"] = 3
-        strategy["refine_limit"] = min(3, num_pages)
+        strategy.update(
+            {
+                "bulk_model": GROQ_VISION_MODEL_MAVERICK,
+                "bulk_batch_size": 1,
+                "bulk_max_dim": 1050,
+                "contrast": 1.6,
+                "sharpness": 1.45,
+                "use_ocr": True,
+                "use_refine": False,  # already using Maverick on every page
+                "refine_limit": 0,
+            }
+        )
+    # Small/medium docs (sweet spot for 30–45s)
+    elif num_pages <= 10:
+        strategy.update(
+            {
+                "bulk_model": GROQ_VISION_MODEL_MAVERICK,
+                "bulk_batch_size": 2,
+                "bulk_max_dim": 950,
+                "contrast": 1.55,
+                "sharpness": 1.4,
+                "use_ocr": True,   # helps find under-extracted pages
+                "use_refine": True,
+                "refine_limit": min(4, num_pages),  # refine 3–4 pages max
+            }
+        )
+    # Medium docs
     elif num_pages <= 15:
-        # Medium docs: refine a few pages
-        strategy["bulk_batch_size"] = 4
-        strategy["refine_limit"] = min(4, max(2, num_pages // 3))
+        strategy.update(
+            {
+                "bulk_model": GROQ_VISION_MODEL_MAVERICK,
+                "bulk_batch_size": 3,
+                "bulk_max_dim": 900,
+                "contrast": 1.5,
+                "sharpness": 1.35,
+                "use_ocr": num_pages <= 12,  # OCR only for <=12 pages
+                "use_refine": True,
+                "refine_limit": min(5, num_pages // 2),
+            }
+        )
+    # Large docs – speed first, refine only a few pages
     else:
-        # Large docs: bigger batches, small refine limit & less OCR
-        strategy["bulk_batch_size"] = 5
-        strategy["refine_limit"] = min(4, max(2, num_pages // 4))
-        strategy["ocr_max_pages"] = min(20, max(10, num_pages // 2))
+        strategy.update(
+            {
+                "bulk_model": GROQ_VISION_MODEL_SCOUT,
+                "bulk_batch_size": 4 if per_page_budget < 5 else 3,
+                "bulk_max_dim": 850,
+                "contrast": 1.45,
+                "sharpness": 1.3,
+                "use_ocr": False,      # OCR is CPU heavy for big PDFs
+                "use_refine": True,
+                "refine_limit": 4,     # refine a few worst pages only
+            }
+        )
 
-    # Respect Groq's batch limit
+    # Always respect Groq's batch limit
     strategy["bulk_batch_size"] = min(strategy["bulk_batch_size"], MAX_IMAGES_PER_REQUEST)
     return strategy
 
@@ -350,33 +397,31 @@ def build_page_infos(
             - ocr_rows: int (approx row count)
     """
     page_infos: List[Dict[str, Any]] = []
-    ocr_max_pages = strategy.get("ocr_max_pages", 9999)
+    use_ocr = strategy.get("use_ocr", False)
 
     for idx, img in enumerate(raw_pages):
         img_proc = img.convert("RGB")
+
         if strategy.get("use_smart_crop", True):
             img_proc = smart_crop(img_proc)
+
         img_proc = enhance_image(
             img_proc,
-            contrast_factor=strategy.get("contrast", 1.4),
-            sharpness_factor=strategy.get("sharpness", 1.3),
+            contrast_factor=strategy.get("contrast", 1.5),
+            sharpness_factor=strategy.get("sharpness", 1.35),
         )
         img_proc = resize_image_max_dim(
-            img_proc, strategy.get("bulk_max_dim", 850)
+            img_proc, strategy.get("bulk_max_dim", 900)
         )
 
-        # OCR row estimation (limited pages for speed)
+        # OCR row estimation (optional)
         ocr_rows = 0
-        if (
-            strategy.get("use_ocr", True)
-            and OCR_AVAILABLE
-            and idx < ocr_max_pages
-        ):
+        if use_ocr and OCR_AVAILABLE:
             ocr_rows = estimate_table_rows(img_proc)
 
         jpeg_bytes = image_to_jpeg_bytes(
             img_proc,
-            quality=strategy.get("jpeg_quality", 45),
+            quality=strategy.get("jpeg_quality", 60),
         )
         data_url = jpeg_bytes_to_data_url(jpeg_bytes)
 
@@ -538,11 +583,10 @@ def parse_llm_json(raw_text: str, src: str) -> Any:
     try:
         return json.loads(text)
     except json.JSONDecodeError:
-        # Try to extract outermost {...}
         first = text.find("{")
         last = text.rfind("}")
         if first != -1 and last != -1 and last > first:
-            json_str = text[first : last + 1]
+            json_str = text[first: last + 1]
             try:
                 return json.loads(json_str)
             except Exception:
@@ -581,6 +625,9 @@ For EACH batch page i (1-based), you must:
         {"type": "input_text", "text": user_text.strip()}
     ]
 
+    # Use lower detail for Scout to save time, higher for Maverick
+    detail_level = "high" if "maverick" in model_id else "auto"
+
     for idx, info in enumerate(batch_page_infos):
         batch_page_no = idx + 1
         user_content.append(
@@ -593,7 +640,7 @@ For EACH batch page i (1-based), you must:
             {
                 "type": "input_image",
                 "image_url": info["data_url"],
-                "detail": "auto",
+                "detail": detail_level,
             }
         )
 
@@ -690,10 +737,7 @@ def call_groq_for_single_page_refine(
                 {
                     "role": "system",
                     "content": [
-                        {
-                            "type": "input_text",
-                            "text": SYSTEM_PROMPT_REFINEMENT.strip(),
-                        }
+                        {"type": "input_text", "text": SYSTEM_PROMPT_REFINEMENT.strip()}
                     ],
                 },
                 {
@@ -741,7 +785,6 @@ def call_groq_for_single_page_refine(
             detail="Refine JSON returned empty pagewise_line_items.",
         )
 
-    # Use first page only (this call is strictly single-page)
     raw_page = raw_pages[0]
     return raw_page, token_usage
 
@@ -861,12 +904,8 @@ def enrich_from_patterns(pages: List[PageItems]) -> List[PageItems]:
                 rates[name_key].append(amt / qty)
                 qtys[name_key].append(qty)
 
-    default_rate = {
-        k: (sum(v) / len(v)) for k, v in rates.items() if v
-    }
-    default_qty = {
-        k: (sum(v) / len(v)) for k, v in qtys.items() if v
-    }
+    default_rate = {k: (sum(v) / len(v)) for k, v in rates.items() if v}
+    default_qty = {k: (sum(v) / len(v)) for k, v in qtys.items() if v}
 
     for p in pages:
         for it in p.bill_items:
@@ -924,7 +963,7 @@ def health_check():
 
 
 # ============================================================
-#  Main Datathon Endpoint (POST) – BALANCED
+#  Main Datathon Endpoint (POST)
 # ============================================================
 
 @app.post("/extract-bill-data", response_model=ExtractBillDataResponse)
@@ -950,11 +989,11 @@ def extract_bill_data(req: ExtractBillDataRequest):
             message="No pages/images could be extracted from the document.",
         )
 
-    # 3. Choose BALANCED strategy & build page_infos
+    # 3. Choose dynamic strategy & build page_infos
     strategy = choose_strategy(num_pages)
     page_infos = build_page_infos(raw_pages, strategy)
 
-    # 4. Bulk pass – process pages in batches (Scout)
+    # 4. Bulk pass – process pages in batches
     all_pages: List[PageItems] = []
     total_tokens = 0
     input_tokens = 0
@@ -998,7 +1037,7 @@ def extract_bill_data(req: ExtractBillDataRequest):
             message="Model did not return any page items.",
         )
 
-    # 5. Maverick refinement on suspicious pages (capped)
+    # 5. Optional refinement with Maverick on suspicious pages
     if strategy.get("use_refine", True) and strategy.get("refine_limit", 0) > 0:
         suspicious_indices: List[int] = []
         for idx, p in enumerate(all_pages):
@@ -1006,20 +1045,20 @@ def extract_bill_data(req: ExtractBillDataRequest):
             n_items = len(p.bill_items)
             page_type = (p.page_type or "").strip().lower()
 
-            # BALANCED heuristics:
-            # - very sparse vs OCR row count → probably under-extraction
-            # - almost empty but OCR shows content
-            # - final bill pages with very few items
-            very_sparse = (ocr_rows >= 8 and n_items <= max(2, ocr_rows // 3))
+            # Heuristics:
+            # - Very sparse vs OCR row count
+            # - Final bill pages
+            # - Almost empty but OCR shows content
+            sparse_vs_ocr = (
+                ocr_rows >= 8 and n_items <= max(3, ocr_rows // 2)
+            )
             almost_empty = (n_items <= 1 and ocr_rows >= 5)
-            suspicious_final = (page_type == "final bill" and n_items < 10)
+            suspicious_final = (page_type == "final bill" and n_items < 5)
 
-            if very_sparse or almost_empty or suspicious_final:
+            if sparse_vs_ocr or almost_empty or suspicious_final:
                 suspicious_indices.append(idx)
 
-        # Limit how many refinement calls we do
-        refine_limit = strategy["refine_limit"]
-        suspicious_indices = suspicious_indices[:refine_limit]
+        suspicious_indices = suspicious_indices[: strategy["refine_limit"]]
 
         for idx in suspicious_indices:
             try:
@@ -1054,7 +1093,7 @@ def extract_bill_data(req: ExtractBillDataRequest):
         output_tokens=output_tokens,
     )
 
-    # 8. Logging
+    # 8. Logging (simple, no extra accuracy logs)
     grand_total = compute_grand_total_amount(all_pages)
     elapsed = time.time() - start_time
 
