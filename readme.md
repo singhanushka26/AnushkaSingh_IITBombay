@@ -260,7 +260,7 @@ Response:
 ## **9. Contact**
 * Name:     Anushka
 * Email:    22b0714@iitb.ac.in
-* College:  IT Bombay
+* College:  IIT Bombay
 ---
 
 ## Final Notes
